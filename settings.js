@@ -22,6 +22,7 @@
       ready: '可以使用',
       notInstalled: '未安装',
       notRunnable: '无法运行',
+      customPathUnavailable: '路径不可用',
       notSignedIn: '未登录',
       checkFailed: '检测失败',
       version: '版本',
@@ -61,12 +62,31 @@
       accountStatusFailed: '没能检查登录状态，请点「重新检测」。',
       loginFailed: function (detail) { return '没能完成登录' + (detail ? '：' + detail : '，请重试。'); },
       logoutFailed: function (detail) { return '没能退出登录' + (detail ? '：' + detail : '，请重试。'); },
+      customPath: '自定义路径',
+      customPathPlaceholder: '留空自动检测 agy 可执行文件',
+      customPathSave: '保存',
+      customPathSaving: '保存中…',
+      customPathReset: '恢复自动',
+      customPathSaved: '已保存自定义路径。',
+      customPathCleared: '已恢复自动检测。',
+      customPathUnavailableNote: '当前自定义路径不可用，请修改路径或点「恢复自动」。',
+      customPathErrors: {
+        busy: '请等 CLI 安装或更新完成后再修改路径。',
+        'not-absolute': '请填写有效的绝对路径。',
+        'not-found': '找不到这个文件，请检查路径。',
+        'not-executable': '这个文件不可执行，请检查权限。',
+        'not-runnable': '找到了这个文件，但无法运行 agy --version。',
+        'unsafe-path': '路径包含 Windows 批处理无法安全执行的字符。',
+        'write-failed': '无法保存路径配置，请检查目录权限。',
+        failed: '保存路径失败，请稍后重试。',
+      },
     },
     en: {
       checking: 'Checking…',
       ready: 'Ready',
       notInstalled: 'Not installed',
       notRunnable: 'Can’t run',
+      customPathUnavailable: 'Path unavailable',
       notSignedIn: 'Not signed in',
       checkFailed: 'Check failed',
       version: 'Version',
@@ -106,6 +126,24 @@
       accountStatusFailed: 'Couldn’t check the sign-in. Click “Check again”.',
       loginFailed: function (detail) { return 'Couldn’t sign in' + (detail ? ': ' + detail : '. Try again.'); },
       logoutFailed: function (detail) { return 'Couldn’t sign out' + (detail ? ': ' + detail : '. Try again.'); },
+      customPath: 'Custom path',
+      customPathPlaceholder: 'Leave blank to auto-detect agy',
+      customPathSave: 'Save',
+      customPathSaving: 'Saving…',
+      customPathReset: 'Auto-detect',
+      customPathSaved: 'Custom path saved.',
+      customPathCleared: 'Switched back to auto-detect.',
+      customPathUnavailableNote: 'The configured custom path is unavailable. Update it or switch back to auto-detect.',
+      customPathErrors: {
+        busy: 'Wait for the CLI install or update to finish before changing the path.',
+        'not-absolute': 'Enter a valid absolute path to the agy executable.',
+        'not-found': 'File not found. Check the path and try again.',
+        'not-executable': 'This file is not executable. Check its permissions.',
+        'not-runnable': 'This file was found, but agy --version could not run.',
+        'unsafe-path': 'This path contains characters cmd.exe cannot run safely.',
+        'write-failed': 'Could not save the path configuration.',
+        failed: 'Could not save the custom path. Try again.',
+      },
     },
   };
 
@@ -116,6 +154,10 @@
   var snapshot = null;
   var error = null;
   var pending = null;
+  var customPathPending = null;
+  var customPathDirty = false;
+  var customPathNote = null;
+  var cliBusy = false;
   /** Last account view from main.js: { signedIn, tier?, canSignIn, canSignOut, busy }. */
   var accountState = null;
   /** Account requests waiting for main.js, by reqId: { reqId, op, acked, sends, resend, deadline }. */
@@ -183,6 +225,9 @@
       } else if (result.reason === 'not-runnable') {
         label = t.notRunnable;
         tone = 'error';
+      } else if (result.reason === 'custom-path-unavailable') {
+        label = t.customPathUnavailable;
+        tone = 'error';
       } else {
         label = t.notInstalled;
       }
@@ -212,7 +257,43 @@
     show('note', Boolean(note));
 
     $('foot').textContent = t.foot;
+    renderCustomPath();
     renderAccount();
+  }
+
+  function customPathNoteText(note) {
+    if (!note) return '';
+    if (note.key === 'saved') return t.customPathSaved;
+    if (note.key === 'cleared') return t.customPathCleared;
+    if (note.key === 'unavailable') return t.customPathUnavailableNote;
+    var base = t.customPathErrors[note.key] || t[note.key] || t.customPathErrors.failed;
+    return note.detail ? base + ' (' + note.detail + ')' : base;
+  }
+
+  function renderCustomPath() {
+    var result = snapshot && snapshot.result;
+    var activeCustom = (result && result.customPath) || '';
+    var configured = Boolean(result && (result.customPath || result.customPathConfigured));
+    $('label-custom-path').textContent = t.customPath;
+    var input = $('custom-path-input');
+    input.placeholder = t.customPathPlaceholder;
+    if (!customPathDirty && !customPathPending) input.value = activeCustom;
+    var locked = Boolean(customPathPending) || cliBusy;
+    input.disabled = locked;
+    var currentVal = (input.value || '').trim();
+    var unchanged = currentVal === activeCustom && !(configured && !activeCustom);
+    var saveBtn = $('custom-path-save');
+    saveBtn.textContent = customPathPending ? t.customPathSaving : t.customPathSave;
+    saveBtn.disabled = locked || unchanged;
+    var resetBtn = $('custom-path-reset');
+    resetBtn.textContent = t.customPathReset;
+    resetBtn.disabled = locked;
+    show('custom-path-reset', configured);
+    var activeNote = customPathNote || (result && result.reason === 'custom-path-unavailable' ? { key: 'unavailable', tone: 'error' } : null);
+    var noteEl = $('custom-path-note');
+    noteEl.textContent = customPathNoteText(activeNote);
+    noteEl.setAttribute('data-tone', activeNote && activeNote.tone === 'error' ? 'error' : 'neutral');
+    show('custom-path-note', Boolean(activeNote));
   }
 
   function accountInFlight(op) {
@@ -397,6 +478,77 @@
     });
   }
 
+  function clearAccountRequests() {
+    for (var id in accountRequests) {
+      if (!Object.prototype.hasOwnProperty.call(accountRequests, id)) continue;
+      clearInterval(accountRequests[id].resend);
+      clearTimeout(accountRequests[id].deadline);
+      delete accountRequests[id];
+    }
+    accountNote = null;
+    confirmingLogout = false;
+  }
+
+  function settleCustomPath(state, message, fallbackErrorKey) {
+    if (customPathPending !== state) return;
+    customPathPending = null;
+    clearInterval(state.resend);
+    clearTimeout(state.deadline);
+    if (message && message.ok && message.snapshot && typeof message.snapshot === 'object') {
+      clearAccountRequests();
+      snapshot = message.snapshot;
+      error = message.snapshot.ok ? null : { key: 'detectFailed', text: message.snapshot.error };
+      if (message.snapshot.account && typeof message.snapshot.account === 'object') accountState = message.snapshot.account;
+      customPathDirty = false;
+      var saved = Boolean(message.snapshot.result && message.snapshot.result.customPath);
+      customPathNote = { key: saved ? 'saved' : 'cleared', tone: 'neutral' };
+      render();
+      if (snapshot.result && snapshot.result.available) requestAccount('status');
+      return;
+    }
+    var code = (message && message.error) || fallbackErrorKey || 'failed';
+    customPathNote = { key: code, detail: message && message.detail, tone: 'error' };
+    renderCustomPath();
+  }
+
+  function requestCustomPath(rawPath) {
+    if (customPathPending) return;
+    var state = {
+      reqId: 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10),
+      path: typeof rawPath === 'string' ? rawPath : '',
+      acked: false,
+      sends: 0,
+      resend: null,
+      deadline: null,
+    };
+    customPathPending = state;
+    customPathNote = null;
+    renderCustomPath();
+    if (!channel) {
+      settleCustomPath(state, null, 'backgroundOff');
+      return;
+    }
+    state.deadline = setTimeout(function () { settleCustomPath(state, null, 'timeout'); }, RESULT_TIMEOUT_MS);
+    var send = function () {
+      if (customPathPending !== state || state.acked) return;
+      if (state.sends >= MAX_SENDS) {
+        settleCustomPath(state, null, 'backgroundOff');
+        return;
+      }
+      state.sends += 1;
+      channel.postMessage({ type: 'custom-path-request', reqId: state.reqId, path: state.path });
+    };
+    wake().then(function (wakeState) {
+      if (customPathPending !== state) return;
+      if (wakeState === 'off' || wakeState === 'fused') {
+        settleCustomPath(state, null, 'backgroundOff');
+        return;
+      }
+      send();
+      state.resend = setInterval(send, RESEND_INTERVAL_MS);
+    });
+  }
+
   if (channel) {
     channel.onmessage = function (event) {
       var data = event && event.data;
@@ -416,6 +568,31 @@
           snapshot = data.snapshot;
           error = data.snapshot.ok ? null : { key: 'detectFailed', text: data.snapshot.error };
           if (data.snapshot.account && typeof data.snapshot.account === 'object') accountState = data.snapshot.account;
+          render();
+        }
+        return;
+      }
+      if (data.type === 'custom-path-ack') {
+        if (customPathPending && data.reqId === customPathPending.reqId) {
+          customPathPending.acked = true;
+          clearInterval(customPathPending.resend);
+        }
+        return;
+      }
+      if (data.type === 'cli-state') {
+        cliBusy = Boolean(data.active && data.action !== 'check');
+        renderCustomPath();
+        return;
+      }
+      if (data.type === 'custom-path-result') {
+        if (customPathPending && data.reqId === customPathPending.reqId) {
+          settleCustomPath(customPathPending, data);
+        } else if (!customPathPending && data.ok && data.snapshot && data.snapshot.result) {
+          clearAccountRequests();
+          snapshot = data.snapshot;
+          error = data.snapshot.ok ? null : { key: 'detectFailed', text: data.snapshot.error };
+          if (data.snapshot.account && typeof data.snapshot.account === 'object') accountState = data.snapshot.account;
+          customPathDirty = false;
           render();
         }
         return;
@@ -440,6 +617,26 @@
       if (data.type === 'locale-changed') loadLocale();
     };
   }
+
+  $('custom-path-input').addEventListener('input', function () {
+    customPathDirty = true;
+    customPathNote = null;
+    renderCustomPath();
+  });
+  $('custom-path-input').addEventListener('keydown', function (event) {
+    if (event && event.key === 'Enter' && !event.isComposing && !$('custom-path-save').disabled) {
+      requestCustomPath($('custom-path-input').value || '');
+    }
+  });
+  $('custom-path-save').addEventListener('click', function () {
+    if (!$('custom-path-save').disabled) requestCustomPath($('custom-path-input').value || '');
+  });
+  $('custom-path-reset').addEventListener('click', function () {
+    if ($('custom-path-reset').disabled) return;
+    $('custom-path-input').value = '';
+    customPathDirty = false;
+    requestCustomPath('');
+  });
 
   $('account-login').addEventListener('click', function () {
     confirmingLogout = false;

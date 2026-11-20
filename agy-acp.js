@@ -19,7 +19,7 @@
  */
 
 const os = require('node:os');
-const { ACP_ARGS, detectAgy, resolveAgy, spawnAgy, killTree } = require('./resolve-agy.js');
+const { ACP_ARGS, detectAgy, readCustomAgyConfig, resolveAgy, spawnAgy, killTree } = require('./resolve-agy.js');
 const remoteWorkspace = require('./remote-workspace.js');
 
 /** agy normally exits right after stdin closes; force it if it lingers. */
@@ -165,6 +165,17 @@ function run(agyPath) {
 const NOT_FOUND_MESSAGE =
   '[agy-acp] The Antigravity CLI (agy) was not found on this computer. Install it from https://antigravity.google, then start the task again.';
 
+function missingAgyMessage() {
+  const cfg = readCustomAgyConfig();
+  if (cfg.kind === 'configured') {
+    return `[agy-acp] The configured Antigravity CLI path (${cfg.path}) was not found or is not executable. Update or clear the custom path in Antigravity plugin settings.`;
+  }
+  if (cfg.kind === 'invalid') {
+    return '[agy-acp] The Antigravity custom path configuration could not be read. Update or clear the custom path in Antigravity plugin settings.';
+  }
+  return NOT_FOUND_MESSAGE;
+}
+
 /**
  * The project is on another computer: only an agy that is known to honour the restricted agent
  * may run the task. Any doubt ends here, before agy sees a single message.
@@ -172,7 +183,7 @@ const NOT_FOUND_MESSAGE =
 async function runRemoteWorkspace() {
   const found = await detectAgy();
   if (!found.path) {
-    exitAfterStderr(NOT_FOUND_MESSAGE, NOT_FOUND_EXIT_CODE);
+    exitAfterStderr(missingAgyMessage(), NOT_FOUND_EXIT_CODE);
     return;
   }
   if (!found.available) {
@@ -203,5 +214,5 @@ if (remoteWorkspace.isRemoteWorkspaceLaunch(process.argv)) {
 } else {
   const agyPath = resolveAgy();
   if (agyPath) run(agyPath);
-  else exitAfterStderr(NOT_FOUND_MESSAGE, NOT_FOUND_EXIT_CODE);
+  else exitAfterStderr(missingAgyMessage(), NOT_FOUND_EXIT_CODE);
 }

@@ -4,7 +4,7 @@ const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const { createMaintenance, download, fail, json, run, versionPattern, watch } = require('./cli-maintenance.cjs');
-const { detectAgy, killTree, spawnAgy } = require('./resolve-agy.js');
+const { detectAgy, killTree, readCustomAgyConfig, spawnAgy } = require('./resolve-agy.js');
 
 const manifestHost = 'https://antigravity-cli-auto-updater-974169037036.us-central1.run.app';
 const storage = 'https://storage.googleapis.com';
@@ -23,7 +23,8 @@ async function latest() {
 
 async function installed() {
   const check = await detectAgy({ timeoutMs: 10000 });
-  return { present: !!check.path, runnable: check.available, version: check.version, path: check.path };
+  const customPathConfigured = Boolean(check.customPathConfigured || readCustomAgyConfig().kind !== 'none');
+  return { present: !!check.path, runnable: check.available, version: check.version, path: check.path, customPathConfigured };
 }
 
 /** agy's own updater; its output goes to the install log. */
@@ -52,6 +53,9 @@ function plan(current) {
 }
 
 async function install(release, current, report) {
+  if (!current.present && (current.customPathConfigured || readCustomAgyConfig().kind !== 'none')) {
+    fail('custom-path');
+  }
   const { bin, target } = installTarget();
   if (updatesInPlace(current)) {
     report.step('native');

@@ -23,7 +23,7 @@ const LOGIN_TIMEOUT_MS = 5 * 60_000;
 const PROGRESS_INTERVAL_MS = 10_000;
 const MAX_DETAIL = 300;
 
-/** The sign-in in progress (at most one): { agy, cancelled }. */
+/** The sign-in in progress (at most one): { agy, child, cancelled }. */
 let activeLogin = null;
 
 function detailOf(error) {
@@ -85,11 +85,17 @@ async function status(params, options) {
  */
 async function login(options, onProgress) {
   if (activeLogin) return { ok: false, error: 'busy' };
-  const state = { agy: null, cancelled: false };
+  const state = { agy: null, child: null, cancelled: false };
   activeLogin = state;
   const ticker = setInterval(() => { if (onProgress) onProgress(); }, PROGRESS_INTERVAL_MS);
   try {
-    state.agy = await openAgy(options);
+    state.agy = await openAgy({
+      ...(options && typeof options === 'object' ? options : null),
+      onSpawn: (child) => {
+        state.child = child;
+        if (state.cancelled) killTree(child);
+      },
+    });
     if (!state.agy) return { ok: false, error: 'not-installed' };
     if (state.cancelled) return { ok: false, error: 'cancelled' };
     if (!canSignIn(state.agy.init)) return { ok: false, error: 'unsupported' };
@@ -112,7 +118,8 @@ function cancelLogin() {
   const state = activeLogin;
   if (!state) return { ok: true, cancelled: false };
   state.cancelled = true;
-  if (state.agy) killTree(state.agy.child);
+  const child = (state.agy && state.agy.child) || state.child;
+  if (child) killTree(child);
   return { ok: true, cancelled: true };
 }
 

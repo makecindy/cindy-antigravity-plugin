@@ -92,6 +92,7 @@ async function openAgy(options) {
   const agyPath = resolveAgy(options);
   if (!agyPath) return null;
   const child = spawnAgy(agyPath, ACP_ARGS, options);
+  if (options && typeof options.onSpawn === 'function') options.onSpawn(child);
   child.stderr.resume();
   const call = connect(child);
   const close = () => {
