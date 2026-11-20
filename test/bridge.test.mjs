@@ -142,6 +142,16 @@ if (STATE) {
   });
   process.stdin.on('end', () => process.exit(0));
 }
+if (!STATE && process.env.FAKE_AGY_STARTUP_PREAMBLE === 'oversized') {
+  const big = Buffer.from('{"jsonrpc":"2.0","method":"big","pad":"' + 'A'.repeat(1024 * 1024 + 128) + '"}\\n', 'utf8');
+  const mid = 600 * 1024;
+  process.stdout.write(big.subarray(0, mid));
+  setTimeout(() => process.stdout.write(big.subarray(mid)), 20);
+} else if (!STATE && process.env.FAKE_AGY_STARTUP_PREAMBLE === 'noise35') {
+  for (let i = 0; i < 35; i += 1) {
+    process.stdout.write('{"jsonrpc":"2.0","method":"noise","i":' + i + '}\\n');
+  }
+}
 const RESULT_JSON = ${JSON.stringify(RESULT_JSON)};
 let buffered = '';
 if (!STATE) process.stdin.on('data', (chunk) => {
@@ -422,6 +432,64 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
     // 1 initialize response + 300 burst notifications
     assert.equal(lines.length, 301, `expected 301 lines, got ${lines.length}`);
     assert.equal(JSON.parse(lines[300]).params.i, 299);
+  });
+
+  test('agy-acp preserves bytes across handshake fallbacks (non-initialize, >1 MiB line, and >32 unmatched lines)', async (t) => {
+    const completeLines = (stdout) => {
+      const text = stdout.text();
+      return text.endsWith('\n') ? text.slice(0, -1).split('\n') : text.split('\n').slice(0, -1);
+    };
+
+    // 1. Non-initialize request first settles relay immediately and passes subsequent responses unchanged.
+    {
+      const fixture = makeFixture(t);
+      const bridge = startBridge(fixture.env);
+      t.after(() => bridge.child.kill());
+      bridge.child.stdin.write('{"jsonrpc":"2.0","id":1,"method":"ping"}\n');
+      await waitFor(() => completeLines(bridge.stdout).length >= 1, 8_000, 'non-init ping reply');
+      bridge.child.stdin.write(INITIALIZE);
+      await waitFor(() => completeLines(bridge.stdout).length >= 2, 8_000, 'non-init fallback');
+      const [pingLine, initLine] = completeLines(bridge.stdout);
+      assert.deepEqual(JSON.parse(pingLine), { jsonrpc: '2.0', id: 1, result: { ok: true, mark: '✓' } });
+      // Relay already left handshake inspection on the non-initialize request, so initialize passes raw.
+      assert.equal(JSON.parse(initLine).result.agentCapabilities.mcpCapabilities, undefined);
+      bridge.child.stdin.end();
+      assert.equal((await bridge.closed).code, 0);
+    }
+
+    // 2. Oversized (>1 MiB) stdout line split across chunks before initialize preserves exact bytes
+    //    and still patches the following initialize response.
+    {
+      const fixture = makeFixture(t, { extraEnv: { FAKE_AGY_STARTUP_PREAMBLE: 'oversized' } });
+      const bridge = startBridge(fixture.env);
+      t.after(() => bridge.child.kill());
+      await waitFor(() => completeLines(bridge.stdout).length >= 1, 8_000, 'oversized preamble line');
+      bridge.child.stdin.write(INITIALIZE);
+      await waitFor(() => completeLines(bridge.stdout).length >= 2, 8_000, 'init after oversized');
+      const [bigLine, initLine] = completeLines(bridge.stdout);
+      assert.equal(JSON.parse(bigLine).pad.length, 1024 * 1024 + 128);
+      assert.equal(JSON.parse(initLine).result.agentCapabilities.mcpCapabilities.http, true);
+      bridge.child.stdin.end();
+      assert.equal((await bridge.closed).code, 0);
+    }
+
+    // 3. More than MAX_HANDSHAKE_LINES (32) unmatched stdout lines transitions to raw pass-through cleanly.
+    {
+      const fixture = makeFixture(t, { extraEnv: { FAKE_AGY_STARTUP_PREAMBLE: 'noise35' } });
+      const bridge = startBridge(fixture.env);
+      t.after(() => bridge.child.kill());
+      await waitFor(() => completeLines(bridge.stdout).length >= 35, 8_000, '35 noise lines');
+      bridge.child.stdin.write(INITIALIZE);
+      await waitFor(() => completeLines(bridge.stdout).length >= 36, 8_000, 'init after 32-line cap');
+      const lines = completeLines(bridge.stdout);
+      assert.equal(lines.length, 36);
+      assert.equal(JSON.parse(lines[0]).i, 0);
+      assert.equal(JSON.parse(lines[34]).i, 34);
+      // Relay hit MAX_HANDSHAKE_LINES and switched to raw pass-through, leaving initialize untouched.
+      assert.equal(JSON.parse(lines[35]).result.agentCapabilities.mcpCapabilities, undefined);
+      bridge.child.stdin.end();
+      assert.equal((await bridge.closed).code, 0);
+    }
   });
 
   /**
