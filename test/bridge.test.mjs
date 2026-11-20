@@ -124,6 +124,7 @@ if (STATE) {
       const { id, method, params } = JSON.parse(line);
       fs.appendFileSync(STATE + '.log', method + (method === 'authenticate' ? ':' + params.methodId : '') + '\\n');
       if (method === 'initialize') {
+        if (process.env.FAKE_AGY_LOGIN === 'hang-init') continue;
         send({ id, result: { protocolVersion: 1, authMethods: [{ id: 'oauth-personal', name: 'Log in with Google' }],
           agentCapabilities: { auth: { logout: {} }, sessionCapabilities: { list: {}, resume: {}, close: {} } } } });
       } else if (method === 'authenticate') {
@@ -1415,6 +1416,49 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
 
     // A new login on B must succeed right away (never stuck as 'busy').
     const loginB = await worker.call({ jsonrpc: '2.0', id: 5, method: 'login', params: {} });
+    assert.equal(loginB.result.ok, true);
+  });
+
+  test('setCustomPath immediately cancels a sign-in stuck in ACP initialize', async (t) => {
+    const stateFile = path.join(os.tmpdir(), `agy-init-cancel-${process.pid}-${Date.now()}`);
+    t.after(() => {
+      fs.rmSync(stateFile, { force: true });
+      fs.rmSync(stateFile + '.log', { force: true });
+    });
+    const fixture = makeFixture(t, { extraEnv: { FAKE_AGY_STATE: stateFile, FAKE_AGY_LOGIN: 'hang-init' } });
+    const dir = path.join(fixture.dir, 'bins');
+    fs.mkdirSync(dir);
+    const script = path.join(dir, 'fake.js');
+    fs.writeFileSync(script, FAKE_AGY_SOURCE, 'utf8');
+    let binB;
+    if (isWin) {
+      binB = path.join(dir, 'agy-b.cmd');
+      fs.writeFileSync(binB, `@set FAKE_AGY_VERSION=2.2.2\r\n@set FAKE_AGY_LOGIN=\r\n@"${process.execPath}" "${script}" %*\r\n`);
+    } else {
+      binB = path.join(dir, 'agy-b');
+      fs.writeFileSync(binB, `#!/bin/sh\nFAKE_AGY_VERSION=2.2.2 FAKE_AGY_LOGIN= exec "${process.execPath}" "${script}" "$@"\n`);
+      fs.chmodSync(binB, 0o755);
+    }
+
+    const worker = startWorker(fixture.env);
+    t.after(() => worker.close());
+
+    // Start login on default binary which hangs before replying to initialize.
+    const loginPending = worker.call({ jsonrpc: '2.0', id: 1, method: 'login', params: {} });
+    await waitFor(() => fs.existsSync(stateFile + '.log') && fs.readFileSync(stateFile + '.log', 'utf8').includes('initialize'), 5_000, 'login initialize sent');
+    const hungPid = readPid(fixture.pidFile);
+    assert.ok(hungPid, 'hung agy process started');
+
+    const startedAt = Date.now();
+    const saveB = worker.call({ jsonrpc: '2.0', id: 2, method: 'setCustomPath', params: { path: binB, locale: 'en' } });
+    const [loginResult, saveResult] = await Promise.all([loginPending, saveB]);
+    assert.ok(Date.now() - startedAt < 5_000, 'cancelled initialize without waiting for 45s timeout');
+    assert.deepEqual(loginResult.result, { ok: false, error: 'cancelled' });
+    assert.equal(saveResult.result.ok, true);
+    assert.equal(saveResult.result.detection.version, '2.2.2');
+    await waitFor(() => !isAlive(hungPid), 3_000, 'hung initialize agy killed');
+
+    const loginB = await worker.call({ jsonrpc: '2.0', id: 3, method: 'login', params: {} });
     assert.equal(loginB.result.ok, true);
   });
 
