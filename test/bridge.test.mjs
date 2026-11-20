@@ -20,10 +20,13 @@ const isWin = process.platform === 'win32';
 
 const RESULT_JSON =
   '{"protocolVersion":1,"agentCapabilities":{"loadSession":false,"promptCapabilities":{"image":false}},' +
-  '"agentInfo":{"name":"fake-agy","title":"假 AGY ✓","version":"0.2.2"},"authMethods":[]}';
+  '"agentInfo":{"name":"fake-agy","title":"假 AGY ✓","version":"1.5.13"},"authMethods":[]}';
+const EXPECTED_RESULT_JSON =
+  '{"protocolVersion":1,"agentCapabilities":{"loadSession":false,"promptCapabilities":{"image":false},"mcpCapabilities":{"http":true}},' +
+  '"agentInfo":{"name":"fake-agy","title":"假 AGY ✓","version":"1.5.13"},"authMethods":[]}';
 const INITIALIZE =
   '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}\n';
-const EXPECTED_RESPONSE = Buffer.from(`{"jsonrpc":"2.0","id":0,"result":${RESULT_JSON}}\n`, 'utf8');
+const EXPECTED_RESPONSE = Buffer.from(`{"jsonrpc":"2.0","id":0,"result":${EXPECTED_RESULT_JSON}}\n`, 'utf8');
 
 const EXPECTED_ACP_ARGS = ['--settings', '{"useG1Credits":false}', 'acp', '--disable-telemetry'];
 
@@ -139,6 +142,16 @@ if (STATE) {
   });
   process.stdin.on('end', () => process.exit(0));
 }
+if (!STATE && process.env.FAKE_AGY_STARTUP_PREAMBLE === 'oversized') {
+  const big = Buffer.from('{"jsonrpc":"2.0","method":"big","pad":"' + 'A'.repeat(1024 * 1024 + 128) + '"}\\n', 'utf8');
+  const mid = 600 * 1024;
+  process.stdout.write(big.subarray(0, mid));
+  setTimeout(() => process.stdout.write(big.subarray(mid)), 20);
+} else if (!STATE && process.env.FAKE_AGY_STARTUP_PREAMBLE === 'noise35') {
+  for (let i = 0; i < 35; i += 1) {
+    process.stdout.write('{"jsonrpc":"2.0","method":"noise","i":' + i + '}\\n');
+  }
+}
 const RESULT_JSON = ${JSON.stringify(RESULT_JSON)};
 let buffered = '';
 if (!STATE) process.stdin.on('data', (chunk) => {
@@ -149,12 +162,27 @@ if (!STATE) process.stdin.on('data', (chunk) => {
     buffered = buffered.slice(index + 1);
     if (!line.trim()) continue;
     const message = JSON.parse(line);
-    if (message.method !== 'initialize') continue;
-    const bytes = Buffer.from('{"jsonrpc":"2.0","id":' + JSON.stringify(message.id) + ',"result":' + RESULT_JSON + '}\\n', 'utf8');
-    // Split inside a multi-byte character: the bridge must relay bytes, not text.
-    const cut = bytes.indexOf(Buffer.from('\\u2713', 'utf8')) + 1;
-    process.stdout.write(bytes.subarray(0, cut));
-    setTimeout(() => process.stdout.write(bytes.subarray(cut)), 50);
+    if (message.method === 'initialize') {
+      const resultPayload = process.env.FAKE_AGY_INIT_RESULT || RESULT_JSON;
+      const bytes = Buffer.from('{"jsonrpc":"2.0","id":' + JSON.stringify(message.id) + ',"result":' + resultPayload + '}\\n', 'utf8');
+      // Split inside a multi-byte character when present: the bridge must reassemble complete lines without corrupting UTF-8.
+      const mark = bytes.indexOf(Buffer.from('\\u2713', 'utf8'));
+      const cut = mark >= 0 ? mark + 1 : Math.floor(bytes.length / 2);
+      process.stdout.write(bytes.subarray(0, cut));
+      setTimeout(() => process.stdout.write(bytes.subarray(cut)), 50);
+    } else if (message.method === 'ping') {
+      const reply = Buffer.from('{"jsonrpc":"2.0","id":' + JSON.stringify(message.id) + ',"result":{"ok":true,"mark":"✓"}}\\n', 'utf8');
+      const cut = reply.indexOf(Buffer.from('\\u2713', 'utf8')) + 1;
+      process.stdout.write(reply.subarray(0, cut));
+      setTimeout(() => process.stdout.write(reply.subarray(cut)), 20);
+    } else if (message.method === 'burst_and_exit') {
+      const count = Number(message.params && message.params.count) || 300;
+      const pad = 'x'.repeat(1000);
+      for (let i = 0; i < count; i += 1) {
+        process.stdout.write('{"jsonrpc":"2.0","method":"burst","params":{"i":' + i + ',"pad":"' + pad + '"}}\\n');
+      }
+      process.stdout.write('', () => process.exit(0));
+    }
   }
 });
 if (!STATE) process.stdin.on('end', () => {
@@ -326,12 +354,20 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
     await worker.close();
   });
 
-  test('agy-acp relays ACP bytes unchanged and exits with agy when stdin closes', async (t) => {
+  test('agy-acp adds mcpCapabilities.http on initialize, relays follow-up bytes unchanged, and exits with agy when stdin closes', async (t) => {
     const fixture = makeFixture(t);
     const bridge = startBridge(fixture.env);
     bridge.child.stdin.write(INITIALIZE);
     await waitFor(() => bridge.stdout.bytes().length >= EXPECTED_RESPONSE.length, 8_000, 'initialize response');
     assert.ok(bridge.stdout.bytes().equals(EXPECTED_RESPONSE), `stdout was ${JSON.stringify(bridge.stdout.text())}`);
+    const parsed = JSON.parse(bridge.stdout.text().trim());
+    assert.equal(parsed.result.agentCapabilities.mcpCapabilities.http, true);
+    assert.equal(parsed.result.agentInfo.title, '假 AGY ✓');
+    const pingReply = Buffer.from('{"jsonrpc":"2.0","id":1,"result":{"ok":true,"mark":"✓"}}\n', 'utf8');
+    bridge.child.stdin.write('{"jsonrpc":"2.0","id":1,"method":"ping"}\n');
+    const expectedAll = Buffer.concat([EXPECTED_RESPONSE, pingReply]);
+    await waitFor(() => bridge.stdout.bytes().length >= expectedAll.length, 8_000, 'follow-up ping response');
+    assert.ok(bridge.stdout.bytes().equals(expectedAll), `stdout was ${JSON.stringify(bridge.stdout.text())}`);
     const pid = readPid(fixture.pidFile);
     assert.ok(pid, 'fake agy wrote its pid');
     assert.ok(isAlive(pid), 'fake agy is running before stdin closes');
@@ -339,9 +375,121 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
     bridge.child.stdin.end();
     const { code } = await bridge.closed;
     assert.equal(code, 0);
-    assert.ok(bridge.stdout.bytes().equals(EXPECTED_RESPONSE), 'no extra bytes on stdout');
+    assert.ok(bridge.stdout.bytes().equals(expectedAll), 'no extra bytes on stdout');
     assert.match(bridge.stderr.text(), /fake-agy: ready/);
     await waitFor(() => !isAlive(pid), 3_000, 'fake agy to exit');
+  });
+
+  test('agy-acp preserves an explicit mcpCapabilities.http: false declaration in local mode', async (t) => {
+    const explicitFalse = JSON.stringify({
+      protocolVersion: 1,
+      agentCapabilities: { loadSession: false, mcpCapabilities: { http: false, sse: true } },
+      agentInfo: { name: 'fake-agy', version: '1.5.13' },
+      authMethods: [],
+    });
+    const fixture = makeFixture(t, { extraEnv: { FAKE_AGY_INIT_RESULT: explicitFalse } });
+    const bridge = startBridge(fixture.env);
+    bridge.child.stdin.write(INITIALIZE);
+    await waitFor(() => bridge.stdout.text().includes('\n'), 8_000, 'initialize response');
+    const parsed = JSON.parse(bridge.stdout.text().trim());
+    assert.deepEqual(parsed.result.agentCapabilities.mcpCapabilities, { http: false, sse: true });
+    bridge.child.stdin.end();
+    const { code } = await bridge.closed;
+    assert.equal(code, 0);
+  });
+
+  test('agy-acp does not advertise mcpCapabilities.http for agy versions older than 1.5.13 in local mode', async (t) => {
+    const olderVersion = JSON.stringify({
+      protocolVersion: 1,
+      agentCapabilities: { loadSession: false },
+      agentInfo: { name: 'fake-agy', version: '1.5.12' },
+      authMethods: [],
+    });
+    const fixture = makeFixture(t, { extraEnv: { FAKE_AGY_INIT_RESULT: olderVersion } });
+    const bridge = startBridge(fixture.env);
+    bridge.child.stdin.write(INITIALIZE);
+    await waitFor(() => bridge.stdout.text().includes('\n'), 8_000, 'initialize response');
+    const parsed = JSON.parse(bridge.stdout.text().trim());
+    assert.equal(parsed.result.agentCapabilities.mcpCapabilities, undefined);
+    bridge.child.stdin.end();
+    const { code } = await bridge.closed;
+    assert.equal(code, 0);
+  });
+
+  test('agy-acp flushes queued stdout burst before exiting under consumer backpressure', async (t) => {
+    const fixture = makeFixture(t);
+    const bridge = startBridge(fixture.env);
+    bridge.child.stdin.write(INITIALIZE);
+    await waitFor(() => bridge.stdout.bytes().length >= EXPECTED_RESPONSE.length, 8_000, 'initialize response');
+    // Stall stdout consumption while fake agy writes ~300 KB and exits immediately.
+    bridge.child.stdout.pause();
+    bridge.child.stdin.write('{"jsonrpc":"2.0","id":2,"method":"burst_and_exit","params":{"count":300}}\n');
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    bridge.child.stdout.resume();
+    const { code } = await bridge.closed;
+    assert.equal(code, 0);
+    const lines = bridge.stdout.text().trim().split('\n');
+    // 1 initialize response + 300 burst notifications
+    assert.equal(lines.length, 301, `expected 301 lines, got ${lines.length}`);
+    assert.equal(JSON.parse(lines[300]).params.i, 299);
+  });
+
+  test('agy-acp preserves bytes across handshake fallbacks (non-initialize, >1 MiB line, and >32 unmatched lines)', async (t) => {
+    const completeLines = (stdout) => {
+      const text = stdout.text();
+      return text.endsWith('\n') ? text.slice(0, -1).split('\n') : text.split('\n').slice(0, -1);
+    };
+
+    // 1. Non-initialize request first settles relay immediately and passes subsequent responses unchanged.
+    {
+      const fixture = makeFixture(t);
+      const bridge = startBridge(fixture.env);
+      t.after(() => bridge.child.kill());
+      bridge.child.stdin.write('{"jsonrpc":"2.0","id":1,"method":"ping"}\n');
+      await waitFor(() => completeLines(bridge.stdout).length >= 1, 8_000, 'non-init ping reply');
+      bridge.child.stdin.write(INITIALIZE);
+      await waitFor(() => completeLines(bridge.stdout).length >= 2, 8_000, 'non-init fallback');
+      const [pingLine, initLine] = completeLines(bridge.stdout);
+      assert.deepEqual(JSON.parse(pingLine), { jsonrpc: '2.0', id: 1, result: { ok: true, mark: '✓' } });
+      // Relay already left handshake inspection on the non-initialize request, so initialize passes raw.
+      assert.equal(JSON.parse(initLine).result.agentCapabilities.mcpCapabilities, undefined);
+      bridge.child.stdin.end();
+      assert.equal((await bridge.closed).code, 0);
+    }
+
+    // 2. Oversized (>1 MiB) stdout line split across chunks before initialize preserves exact bytes
+    //    and still patches the following initialize response.
+    {
+      const fixture = makeFixture(t, { extraEnv: { FAKE_AGY_STARTUP_PREAMBLE: 'oversized' } });
+      const bridge = startBridge(fixture.env);
+      t.after(() => bridge.child.kill());
+      await waitFor(() => completeLines(bridge.stdout).length >= 1, 8_000, 'oversized preamble line');
+      bridge.child.stdin.write(INITIALIZE);
+      await waitFor(() => completeLines(bridge.stdout).length >= 2, 8_000, 'init after oversized');
+      const [bigLine, initLine] = completeLines(bridge.stdout);
+      assert.equal(JSON.parse(bigLine).pad.length, 1024 * 1024 + 128);
+      assert.equal(JSON.parse(initLine).result.agentCapabilities.mcpCapabilities.http, true);
+      bridge.child.stdin.end();
+      assert.equal((await bridge.closed).code, 0);
+    }
+
+    // 3. More than MAX_HANDSHAKE_LINES (32) unmatched stdout lines transitions to raw pass-through cleanly.
+    {
+      const fixture = makeFixture(t, { extraEnv: { FAKE_AGY_STARTUP_PREAMBLE: 'noise35' } });
+      const bridge = startBridge(fixture.env);
+      t.after(() => bridge.child.kill());
+      await waitFor(() => completeLines(bridge.stdout).length >= 35, 8_000, '35 noise lines');
+      bridge.child.stdin.write(INITIALIZE);
+      await waitFor(() => completeLines(bridge.stdout).length >= 36, 8_000, 'init after 32-line cap');
+      const lines = completeLines(bridge.stdout);
+      assert.equal(lines.length, 36);
+      assert.equal(JSON.parse(lines[0]).i, 0);
+      assert.equal(JSON.parse(lines[34]).i, 34);
+      // Relay hit MAX_HANDSHAKE_LINES and switched to raw pass-through, leaving initialize untouched.
+      assert.equal(JSON.parse(lines[35]).result.agentCapabilities.mcpCapabilities, undefined);
+      bridge.child.stdin.end();
+      assert.equal((await bridge.closed).code, 0);
+    }
   });
 
   /**
