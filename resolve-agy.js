@@ -4,12 +4,15 @@
  * Locate and launch the Antigravity CLI (`agy`) installed on this computer.
  *
  * Shared by worker.js (availability detection) and agy-acp.js (the ACP entry), so
- * both always agree on which executable is used: the first match in a fixed,
- * documented search order.
+ * both always agree on which executable is used: either the validated custom path
+ * configured in the user's config file, or the first match in a fixed, documented
+ * search order.
  *
- * Safety: the executable path comes only from the file system, every argument is a
- * constant from this package (checked against SAFE_ARG, or one of CONSTANT_ARGS), and a
- * shell is used only where Windows requires it for `.cmd` / `.bat` shims.
+ * Safety: the executable path is either auto-discovered on the file system or an
+ * explicit absolute file path saved by the user (and checked for cmd.exe safety on
+ * Windows `.cmd`/`.bat` shims); every argument is a constant from this package
+ * (checked against SAFE_ARG, or one of CONSTANT_ARGS), and a shell is used only
+ * where Windows requires it for `.cmd` / `.bat` shims.
  */
 
 const fs = require('node:fs');
@@ -39,15 +42,23 @@ for (const arg of CONSTANT_ARGS) {
 function cmdArg(arg) {
   return SAFE_ARG.test(arg) ? arg : '"' + arg.replace(/"/g, '\\"') + '"';
 }
-/** How Cindy starts agy's ACP server. */
+/** How Cindy starts agy: session settings (no paid credits), ACP mode, no telemetry. */
 const ACP_ARGS = Object.freeze(['--settings', SESSION_SETTINGS, 'acp', '--disable-telemetry']);
 const WINDOWS_EXTENSIONS = ['.exe', '.cmd', '.bat'];
 const MAX_NVM_VERSIONS = 16;
+const MAX_CONFIG_BYTES = 16 * 1024;
+const MAX_CUSTOM_PATH_LENGTH = 1024;
+const CONFIG_DIR_NAME = 'cindy-agy-acp';
+const CONFIG_FILE_NAME = 'config.json';
 
 const MESSAGES = Object.freeze({
   'not-installed': Object.freeze({
     'zh-CN': '未找到 Antigravity 命令行（agy）。请先从 https://antigravity.google 安装，然后点「重新检测」。',
     en: 'The Antigravity CLI (agy) was not found. Install it from https://antigravity.google, then select Check again.',
+  }),
+  'custom-path-unavailable': Object.freeze({
+    'zh-CN': '自定义的 Antigravity 命令行路径不可用。请打开 Antigravity 插件设置修改路径或恢复自动检测。',
+    en: 'The configured Antigravity CLI path is unavailable. Open the Antigravity plugin settings to update it or switch back to auto-detect.',
   }),
   'not-runnable': Object.freeze({
     'zh-CN': '找到了 Antigravity 命令行（agy），但无法运行。请重新安装后点「重新检测」。',
@@ -249,8 +260,134 @@ function findAgyCandidates(options) {
   return found;
 }
 
-/** The agy executable Cindy will use, or null when none is installed. */
+/** Per-user machine-local config file shared by worker.js and agy-acp.js (survives plugin updates). */
+function configFilePath(options) {
+  const ctx = context(options);
+  if (ctx.win) {
+    const base = envGet(ctx.env, 'LOCALAPPDATA', true);
+    if (base && isWindowsFullAbsolute(base)) return ctx.p.join(base, CONFIG_DIR_NAME, CONFIG_FILE_NAME);
+    const home = homeDir(ctx);
+    return home && isWindowsFullAbsolute(home) ? ctx.p.join(home, 'AppData', 'Local', CONFIG_DIR_NAME, CONFIG_FILE_NAME) : null;
+  }
+  const xdg = envGet(ctx.env, 'XDG_CONFIG_HOME', false);
+  if (xdg && ctx.p.isAbsolute(xdg)) return ctx.p.join(xdg, CONFIG_DIR_NAME, CONFIG_FILE_NAME);
+  const home = homeDir(ctx);
+  return home && ctx.p.isAbsolute(home) ? ctx.p.join(home, '.config', CONFIG_DIR_NAME, CONFIG_FILE_NAME) : null;
+}
+
+/** Windows drive-qualified (C:\...) or UNC (\\server\share...) absolute path — never drive-relative (\bin\agy). */
+function isWindowsFullAbsolute(value) {
+  return /^[A-Za-z]:[\\/]/.test(value) || /^\\\\[^\\/]+[\\/][^\\/]+/.test(value);
+}
+
+/** Normalizes and syntactically checks a user-supplied custom agy executable path. */
+function normalizeCustomPath(raw, options) {
+  if (typeof raw !== 'string') return { ok: false, error: 'not-absolute' };
+  let value = raw.trim();
+  const quoted = /^(["'])(.*)\1$/.exec(value);
+  if (quoted) value = quoted[2].trim();
+  if (!value) return { ok: true, path: null };
+  // eslint-disable-next-line no-control-regex
+  if (value.length > MAX_CUSTOM_PATH_LENGTH || /[\u0000-\u001f\u007f]/.test(value)) {
+    return { ok: false, error: 'not-absolute' };
+  }
+  const ctx = context(options);
+  if (value === '~' || value.startsWith('~/') || (ctx.win && value.startsWith('~\\'))) {
+    const home = homeDir(ctx);
+    if (!home) return { ok: false, error: 'not-absolute' };
+    value = home + value.slice(1);
+  }
+  if (ctx.win ? !isWindowsFullAbsolute(value) : !ctx.p.isAbsolute(value)) {
+    return { ok: false, error: 'not-absolute' };
+  }
+  const normalized = ctx.p.normalize(value);
+  if (ctx.win && /\.(?:cmd|bat)$/i.test(normalized) && /["%!\r\n]/.test(normalized)) {
+    return { ok: false, error: 'unsafe-path' };
+  }
+  return { ok: true, path: normalized };
+}
+
+/** Validates a user-supplied custom agy executable path (empty string resets to auto-discovery). */
+function validateCustomPath(raw, options) {
+  const norm = normalizeCustomPath(raw, options);
+  if (!norm.ok || norm.path === null) return norm;
+  const ctx = context(options);
+  if (!isFile(norm.path)) return { ok: false, error: 'not-found' };
+  if (!isExecutable(norm.path, ctx.win)) return { ok: false, error: 'not-executable' };
+  return norm;
+}
+
+/**
+ * Reads the custom path configuration state:
+ * - `{ kind: 'none' }` when no config file exists (auto-discovery active)
+ * - `{ kind: 'configured', path }` when a valid custom path is saved
+ * - `{ kind: 'invalid' }` when config.json exists but is unreadable, corrupt, oversized, or invalid
+ */
+function readCustomAgyConfig(options) {
+  const file = configFilePath(options);
+  if (!file) return { kind: 'none' };
+  let stat;
+  try {
+    stat = fs.statSync(file);
+  } catch (error) {
+    return error && error.code === 'ENOENT' ? { kind: 'none' } : { kind: 'invalid' };
+  }
+  if (!stat.isFile() || stat.size > MAX_CONFIG_BYTES) return { kind: 'invalid' };
+  let data;
+  try {
+    data = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return { kind: 'invalid' };
+  }
+  if (!data || typeof data !== 'object' || typeof data.customPath !== 'string') return { kind: 'invalid' };
+  const norm = normalizeCustomPath(data.customPath, options);
+  if (!norm.ok || !norm.path) return { kind: 'invalid' };
+  return { kind: 'configured', path: norm.path };
+}
+
+/** Reads the user-configured custom agy path, or null when not validly configured. */
+function readCustomAgyPath(options) {
+  const cfg = readCustomAgyConfig(options);
+  return cfg.kind === 'configured' ? cfg.path : null;
+}
+
+/** Validates and atomically saves (or clears when empty) the custom agy path. */
+function writeCustomAgyPath(raw, options) {
+  const checked = validateCustomPath(raw, options);
+  if (!checked.ok) return checked;
+  const file = configFilePath(options);
+  if (!file) return { ok: false, error: 'write-failed' };
+  if (checked.path === null) {
+    try {
+      fs.rmSync(file, { force: true });
+    } catch {
+      return { ok: false, error: 'write-failed' };
+    }
+    return { ok: true, customPath: null };
+  }
+  const ctx = context(options);
+  const dir = ctx.p.dirname(file);
+  const tmp = `${file}.${process.pid}.${Math.random().toString(36).slice(2, 8)}.tmp`;
+  try {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(tmp, JSON.stringify({ customPath: checked.path }, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 });
+    fs.renameSync(tmp, file);
+    return { ok: true, customPath: checked.path };
+  } catch {
+    try { fs.rmSync(tmp, { force: true }); } catch { /* ignore cleanup error */ }
+    return { ok: false, error: 'write-failed' };
+  }
+}
+
+/**
+ * The agy executable Cindy will use, or null when none is available.
+ * When a custom path config file exists (valid or corrupt), auto-discovery is never used as a fallback.
+ */
 function resolveAgy(options) {
+  const ctx = context(options);
+  const cfg = readCustomAgyConfig(options);
+  if (cfg.kind === 'invalid') return null;
+  if (cfg.kind === 'configured') return isExecutable(cfg.path, ctx.win) ? cfg.path : null;
   return findAgyCandidates(options)[0] || null;
 }
 
@@ -430,16 +567,51 @@ function unavailable(reason, locale) {
 
 /**
  * Detection result for the logic page:
- * { available, path?, version?, reason?: 'not-installed' | 'not-runnable',
+ * { available, path?, customPath?, customPathConfigured?, version?,
+ *   reason?: 'not-installed' | 'custom-path-unavailable' | 'not-runnable',
  *   message?, messages?: { 'zh-CN', en }, detail? }
  */
 async function detectAgy(options) {
+  const ctx = context(options);
   const locale = options && options.locale;
-  const agyPath = resolveAgy(options);
-  if (!agyPath) return unavailable('not-installed', locale);
+  const cfg = readCustomAgyConfig(options);
+  if (cfg.kind === 'invalid') {
+    return {
+      ...unavailable('custom-path-unavailable', locale),
+      customPathConfigured: true,
+      detail: 'Custom path configuration could not be read. Save a new path or switch back to auto-detect.',
+    };
+  }
+  const customPath = cfg.kind === 'configured' ? cfg.path : null;
+  const agyPath = customPath
+    ? (isExecutable(customPath, ctx.win) ? customPath : null)
+    : (findAgyCandidates(options)[0] || null);
+  if (!agyPath) {
+    if (customPath) {
+      return {
+        ...unavailable('custom-path-unavailable', locale),
+        customPath,
+        customPathConfigured: true,
+        detail: cleanText(`Configured path was not found or is not executable: ${customPath}`, 200),
+      };
+    }
+    return unavailable('not-installed', locale);
+  }
   const run = await runVersion(agyPath, options);
-  if (!run.ok) return { ...unavailable('not-runnable', locale), path: agyPath, detail: run.detail };
-  return { available: true, path: agyPath, ...(run.version ? { version: run.version } : {}) };
+  if (!run.ok) {
+    return {
+      ...unavailable('not-runnable', locale),
+      path: agyPath,
+      ...(customPath ? { customPath, customPathConfigured: true } : {}),
+      detail: run.detail,
+    };
+  }
+  return {
+    available: true,
+    path: agyPath,
+    ...(customPath ? { customPath, customPathConfigured: true } : {}),
+    ...(run.version ? { version: run.version } : {}),
+  };
 }
 
 module.exports = {
@@ -449,10 +621,16 @@ module.exports = {
   SESSION_SETTINGS,
   candidateDirs,
   childEnv,
+  configFilePath,
   detectAgy,
   findAgyCandidates,
   killTree,
   pickLocale,
+  readCustomAgyConfig,
+  readCustomAgyPath,
   resolveAgy,
+  runVersion,
   spawnAgy,
+  validateCustomPath,
+  writeCustomAgyPath,
 };

@@ -11,6 +11,9 @@
  *   page -> { type: 'detect-request', reqId }   (resent until acknowledged)
  *   main -> { type: 'detect-ack', reqId }
  *   main -> { type: 'detect-result', reqId, snapshot }
+ *   page -> { type: 'custom-path-request', reqId, path }   (resent until acknowledged)
+ *   main -> { type: 'custom-path-ack', reqId }
+ *   main -> { type: 'custom-path-result', reqId, ok, snapshot?, error?, detail? }
  *   main -> { type: 'locale-changed' }
  *   page -> { type: 'account-request', reqId, op: 'status' | 'login' | 'cancel' | 'logout' }  (resent until acknowledged)
  *   main -> { type: 'account-ack', reqId }
@@ -55,6 +58,7 @@
   var lastError = null;
   var lastCheckedAt = 0;
   var inflight = null;
+  var pathGeneration = 0;
   var seenRequests = [];
   var channel = typeof BroadcastChannel === 'function' ? new BroadcastChannel(CHANNEL_NAME) : null;
   // Coalesce settings checks. Drop a read
@@ -253,14 +257,22 @@
     });
   }
 
+  var CUSTOM_PATH_ERRORS = ['not-absolute', 'not-found', 'not-executable', 'not-runnable', 'unsafe-path', 'write-failed'];
+
   function sanitizeResult(raw) {
     var result = {
       available: raw.available === true,
       path: shortString(raw.path, 1024),
+      customPath: shortString(raw.customPath, 1024),
+      customPathConfigured: raw.customPathConfigured === true,
       version: shortString(raw.version, 64),
     };
     if (!result.available) {
-      result.reason = raw.reason === 'not-runnable' ? 'not-runnable' : 'not-installed';
+      result.reason = raw.reason === 'not-runnable'
+        ? 'not-runnable'
+        : raw.reason === 'custom-path-unavailable'
+          ? 'custom-path-unavailable'
+          : 'not-installed';
       result.message = shortString(raw.message, 200);
       result.messages = raw.messages && typeof raw.messages === 'object'
         ? { 'zh-CN': shortString(raw.messages['zh-CN'], 200), en: shortString(raw.messages.en, 200) }
@@ -313,7 +325,8 @@
 
   function detect() {
     if (inflight) return inflight;
-    inflight = Promise.resolve()
+    var gen = pathGeneration;
+    var run = Promise.resolve()
       .then(function () {
         return cindy.node.request({ method: 'detect', params: { locale: locale }, timeoutMs: DETECT_TIMEOUT_MS });
       })
@@ -321,6 +334,7 @@
         return { ok: false, message: String((error && error.message) || error) };
       })
       .then(function (response) {
+        if (gen !== pathGeneration) return snapshot();
         lastCheckedAt = Date.now();
         if (!response || response.ok !== true || !response.result || typeof response.result !== 'object') {
           // Detection itself failed (e.g. the Node runtime is unavailable). Publish
@@ -333,19 +347,78 @@
         if (!lastResult.available) clearUsage();
         else if (usageWanted) void refreshUsage();
         return publish(lastResult).then(function (published) {
+          if (gen !== pathGeneration) return snapshot();
           lastPublish = published;
           return snapshot();
         });
       })
       .then(function (value) {
-        inflight = null;
+        if (inflight === run) inflight = null;
         return value;
       }, function (error) {
-        inflight = null;
-        lastError = String((error && error.message) || error);
+        if (inflight === run) inflight = null;
+        if (gen === pathGeneration) lastError = String((error && error.message) || error);
         return snapshot();
       });
-    return inflight;
+    inflight = run;
+    return run;
+  }
+
+  function setCustomPath(rawPath) {
+    if (typeof rawPath !== 'string') return Promise.resolve({ ok: false, error: 'not-absolute' });
+    return Promise.resolve()
+      .then(function () {
+        return cindy.node.request({
+          method: 'setCustomPath',
+          params: { path: rawPath, locale: locale },
+          timeoutMs: DETECT_TIMEOUT_MS,
+        });
+      })
+      .catch(function (error) {
+        return { ok: false, message: String((error && error.message) || error) };
+      })
+      .then(function (response) {
+        if (!response || response.ok !== true || !response.result || typeof response.result !== 'object') {
+          return {
+            ok: false,
+            error: 'failed',
+            detail: shortString(response && (response.message || response.errorCode), 300),
+          };
+        }
+        if (response.result.ok !== true || !response.result.detection || typeof response.result.detection !== 'object') {
+          var code = CUSTOM_PATH_ERRORS.indexOf(response.result.error) !== -1 ? response.result.error : 'failed';
+          var out = { ok: false, error: code };
+          var detail = shortString(response.result.detail, 300);
+          if (detail) out.detail = detail;
+          return out;
+        }
+        // Invalidate every in-flight detect / model-list / account check from the previous executable.
+        pathGeneration += 1;
+        inflight = null;
+        modelsInflight = null;
+        accountCheck = null;
+        models = null;
+        modes = null;
+        defaultMode = null;
+        modelsListedAt = 0;
+        modelSessionId = null;
+        signInRequired = false;
+        account = { signedIn: null, tier: null, canSignIn: true, canSignOut: true };
+        accountSeenAt = 0;
+        accountActionAt = Date.now();
+        lastCheckedAt = Date.now();
+        lastError = null;
+        lastResult = sanitizeResult(response.result.detection);
+        clearUsage();
+        saveState();
+        announceAccount();
+        if (lastResult.available) void refreshUsage();
+        var gen = pathGeneration;
+        return publish(lastResult).then(function (published) {
+          if (gen === pathGeneration) lastPublish = published;
+          return { ok: true, snapshot: snapshot() };
+        });
+      });
   }
 
   /**
@@ -360,7 +433,8 @@
     if (mode === 'if-missing' && models && models.length) return Promise.resolve();
     if (mode === 'if-stale' && models && Date.now() - modelsListedAt < MODELS_MIN_INTERVAL_MS) return Promise.resolve();
     var startedAt = Date.now();
-    modelsInflight = Promise.resolve()
+    var gen = pathGeneration;
+    var run = Promise.resolve()
       .then(function () {
         return cindy.node.request({
           method: 'listModels',
@@ -369,6 +443,7 @@
         });
       })
       .then(function (response) {
+        if (gen !== pathGeneration) return undefined;
         var result = response && response.ok === true ? response.result : null;
         // A sign-in or sign-out made while this listing ran is newer than what the listing saw.
         var fresh = accountActionAt < startedAt;
@@ -397,11 +472,14 @@
         if (typeof result.sessionId === 'string') modelSessionId = result.sessionId.slice(0, 128);
         saveState();
         if (!changed || !lastResult) return undefined;
-        return publish(lastResult).then(function (published) { lastPublish = published; });
+        return publish(lastResult).then(function (published) {
+          if (gen === pathGeneration) lastPublish = published;
+        });
       })
       .catch(function () { /* keep the previous list */ })
-      .then(function () { modelsInflight = null; });
-    return modelsInflight;
+      .then(function () { if (modelsInflight === run) modelsInflight = null; });
+    modelsInflight = run;
+    return run;
   }
 
   /** cindy.node.request -> the worker's result, or null when the request itself failed. */
@@ -426,15 +504,17 @@
     if (accountCheck) return accountCheck;
     if (!lastResult || !lastResult.available) return Promise.resolve({});
     var startedAt = Date.now();
+    var gen = pathGeneration;
     // After a model listing (it resumes the same agy session): a listing that just finished already
     // told us whether agy is signed in.
-    accountCheck = Promise.resolve(modelsInflight)
+    var run = Promise.resolve(modelsInflight)
       .then(function () {
+        if (gen !== pathGeneration) return { stale: true };
         if (account.signedIn !== null && Date.now() - accountSeenAt < ACCOUNT_FRESH_MS) return { fresh: true };
         return nodeCall('account', { params: modelSessionId ? { sessionId: modelSessionId } : {}, timeoutMs: ACCOUNT_TIMEOUT_MS });
       })
       .then(function (result) {
-        if (result && result.fresh) return {};
+        if (gen !== pathGeneration || (result && (result.fresh || result.stale))) return {};
         if (!result || result.supported !== true || typeof result.signedIn !== 'boolean') return failure(null);
         if (accountActionAt >= startedAt) return {};
         account.canSignIn = result.canSignIn !== false;
@@ -442,11 +522,12 @@
         return applySignedIn(result.signedIn, result.tier).then(function () { return {}; });
       })
       .then(function (outcome) {
-        accountCheck = null;
-        announceAccount();
+        if (accountCheck === run) accountCheck = null;
+        if (gen === pathGeneration) announceAccount();
         return outcome;
       });
-    return accountCheck;
+    accountCheck = run;
+    return run;
   }
 
   /** agy's Google sign-in (agy opens the browser); then the models are read again. */
@@ -648,6 +729,25 @@
               channel.postMessage({ type: 'detect-result', reqId: data.reqId, snapshot: snapshot() });
             }
           });
+        });
+        return;
+      }
+      if (data.type === 'custom-path-request') {
+        channel.postMessage({ type: 'custom-path-ack', reqId: data.reqId });
+        if (!remember(data.reqId)) return;
+        setCustomPath(data.path).then(function (outcome) {
+          var message = { type: 'custom-path-result', reqId: data.reqId, ok: outcome.ok === true };
+          if (outcome.snapshot) message.snapshot = outcome.snapshot;
+          if (outcome.error) message.error = outcome.error;
+          if (outcome.detail) message.detail = outcome.detail;
+          channel.postMessage(message);
+          if (outcome.ok && lastResult && lastResult.available) {
+            refreshModels('force').then(function () {
+              if (outcome.snapshot && signInRequired !== outcome.snapshot.signInRequired) {
+                channel.postMessage({ type: 'detect-result', reqId: data.reqId, snapshot: snapshot() });
+              }
+            });
+          }
         });
         return;
       }

@@ -26,6 +26,7 @@ window.createCliMaintenance = function (channel, refresh, refreshId) {
       busy: '操作正在另一处进行，请稍后重试。', verify: '安装后仍未检测到目标版本，请重新检测。',
       operation: '安装或更新未完成，请重试。',
       'close-agy': '请关闭正在运行的 Antigravity CLI，再重试。', timeout: '未收到操作结果，请先重新检测。',
+      'custom-path': '已配置自定义路径，请先修改路径或点「恢复自动」，再从官方安装。',
       steps: {
         resolve: '获取官方最新版本', node: '检查 Node.js 和 npm', npm: '从 npm 下载并安装', download: '下载安装包',
         extract: '解压安装包', signature: '检查应用签名', probe: '检查新版本能否运行', activate: '启用新版本',
@@ -49,6 +50,7 @@ window.createCliMaintenance = function (channel, refresh, refreshId) {
       busy: 'An operation is already running. Try again later.', verify: 'The expected version was not detected after installation. Check again.',
       operation: 'Installation or update did not finish. Try again.',
       'close-agy': 'Close running Antigravity CLI sessions and try again.', timeout: 'No result was received. Check the local CLI again.',
+      'custom-path': 'A custom path is configured. Update it or switch back to auto-detect before installing from the official source.',
       steps: {
         resolve: 'Getting the latest official version', node: 'Checking Node.js and npm', npm: 'Downloading and installing from npm',
         download: 'Downloading the package', extract: 'Extracting the package', signature: 'Checking the app signature',
@@ -158,8 +160,9 @@ window.createCliMaintenance = function (channel, refresh, refreshId) {
 
   function render() {
     const text = strings[locale];
-    const missing = local?.reason === 'not-installed' || (!local && result?.state === 'missing');
-    const next = missing ? 'install' : ['newer', 'unknown'].includes(result?.state) ? 'update' : 'check';
+    const customUnavailable = local?.reason === 'custom-path-unavailable';
+    const missing = !customUnavailable && (local?.reason === 'not-installed' || (!local && result?.state === 'missing'));
+    const next = missing ? 'install' : !customUnavailable && ['newer', 'unknown'].includes(result?.state) ? 'update' : 'check';
     const key = pending ? { install: 'installing', check: 'checking', update: 'updating' }[pending.action] :
       result?.error || result?.state;
     const offer = !detecting && !pending && next !== 'check';
@@ -217,7 +220,7 @@ window.createCliMaintenance = function (channel, refresh, refreshId) {
   function checkWhenReady() {
     if (!checkRequested || !synchronized || detecting || pending || !detected) return;
     checkRequested = false;
-    if (local.reason !== 'not-installed') start('check');
+    if (local.reason !== 'not-installed' && local.reason !== 'custom-path-unavailable') start('check');
   }
   function checkAgain() {
     if (pending || !channel) return;
@@ -236,8 +239,13 @@ window.createCliMaintenance = function (channel, refresh, refreshId) {
   return function renderMaintenance(status, language, checking) {
     detecting = checking;
     detected = Boolean(status);
-    if (status && local && (status.version !== local.version || status.reason !== local.reason) && result?.state !== 'installed') {
+    const changed = Boolean(status && local && (
+      status.version !== local.version || status.reason !== local.reason ||
+      status.path !== local.path || status.customPath !== local.customPath
+    ));
+    if (changed && result?.state !== 'installed') {
       result = undefined;
+      if (status.available) checkRequested = true;
     }
     if (status) local = status;
     locale = /^zh\b/i.test(language) ? 'zh-CN' : 'en';

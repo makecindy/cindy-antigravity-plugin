@@ -5,9 +5,12 @@
  * stdout carries protocol messages only.
  *
  * Methods:
- *   detect({ locale? }) -> { available, path?, version?, reason?, message?, messages?, detail? }
+ *   detect({ locale? }) -> { available, path?, customPath?, customPathConfigured?, version?, reason?, message?, messages?, detail? }
  *     Finds the local agy executable and checks that `agy --version` runs. `message`
  *     is in the requested locale ('zh-CN' or English); `messages` carries both.
+ *   setCustomPath({ path, locale? }) -> { ok: true, customPath, detection } | { ok: false, error, detail? }
+ *     Validates and probes a user-supplied absolute path to agy before saving it, or clears it
+ *     when `path` is an empty string, then returns a fresh detection result.
  *   listModels({ sessionId? })
  *     -> { supported: true, models: [{ id, name, description?, group?, efforts?, defaultEffort? }],
  *          modes?, defaultMode?, sessionId? }
@@ -31,7 +34,7 @@
 
 const readline = require('node:readline');
 const maintain = require('./cli-installer.cjs');
-const { detectAgy } = require('./resolve-agy.js');
+const { detectAgy, readCustomAgyConfig, runVersion, validateCustomPath, writeCustomAgyPath } = require('./resolve-agy.js');
 const { listModels } = require('./agy-models.js');
 const account = require('./agy-account.js');
 
@@ -46,6 +49,9 @@ function replyError(id, code, message) {
 let usageRead;
 const handlers = {
   cliMaintenance(params) {
+    if (params && params.action === 'install' && readCustomAgyConfig().kind !== 'none') {
+      return { error: 'custom-path' };
+    }
     return maintain(params, (method, data) => reply({ jsonrpc: '2.0', method, ...(data ? { params: data } : {}) }));
   },
   usage() {
@@ -60,6 +66,21 @@ const handlers = {
   async detect(params) {
     const locale = params && typeof params.locale === 'string' ? params.locale : undefined;
     return detectAgy({ locale });
+  },
+  async setCustomPath(params) {
+    if (!params || typeof params.path !== 'string') return { ok: false, error: 'not-absolute' };
+    const locale = typeof params.locale === 'string' ? params.locale : undefined;
+    const checked = validateCustomPath(params.path);
+    if (!checked.ok) return { ok: false, error: checked.error };
+    if (checked.path !== null) {
+      const probe = await runVersion(checked.path);
+      if (!probe.ok) return { ok: false, error: 'not-runnable', detail: probe.detail };
+    }
+    const saved = writeCustomAgyPath(params.path);
+    if (!saved.ok) return { ok: false, error: saved.error };
+    usageRead = undefined;
+    const detection = await detectAgy({ locale });
+    return { ok: true, customPath: saved.customPath, detection };
   },
   async account(params) {
     return account.status(params).catch((error) => ({

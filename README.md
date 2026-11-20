@@ -109,20 +109,22 @@ agy --settings {"useG1Credits":false} acp --disable-telemetry
 | --- | --- |
 | `ghost.json` | 清单：`node` 工作进程、额外入口 `agy-acp.js`、`harnesses` 声明、设置页、常驻逻辑页 |
 | `main.js` | 逻辑页：检测 agy、读取模型与模式，`PUT /harnesses` 发布可用状态 |
-| `worker.js` | Node 工作进程（json-rpc-stdio），提供 `detect`、`listModels`、`account`、`login`、`cancelLogin`、`logout` |
-| `resolve-agy.js` | 查找与启动 agy 的共用代码（worker 与 ACP 入口用同一套查找顺序与参数） |
+| `worker.js` | Node 工作进程（json-rpc-stdio），提供 `detect`、`setCustomPath`、`listModels`、`account`、`login`、`cancelLogin`、`logout` |
+| `resolve-agy.js` | 查找与启动 agy 的共用代码（worker 与 ACP 入口用同一套自定义路径、查找顺序与参数） |
 | `agy-client.js` | 插件自用的短时 ACP 连接（启动 agy、`initialize`、调用、停止） |
 | `agy-models.js` | 经 ACP 读取模型、每个模型的思考深度、agy 的工作模式与订阅档位 |
 | `agy-account.js` | 经 ACP 查询登录状态、用 Google 登录、取消登录、退出登录 |
 | `agy-acp.js` | ACP 引擎入口：启动 `agy acp`，双向原样转发 stdio |
 | `remote-workspace.js` | 任务文件在另一台电脑时：受限 Agent 的定义、两段式启动，以及读懂 ACP 的转接 |
-| `settings.html` / `settings.js` | 设置页：检测结果、版本、位置、安装提示、账号（登录 / 退出）与「重新检测」 |
+| `settings.html` / `settings.js` | 设置页：检测结果、版本、位置、自定义路径、安装提示、账号（登录 / 退出）与「重新检测」 |
 | `locales/` | 清单名称与说明的英文、简体中文文案 |
-| `test/bridge.test.mjs` | 用假 agy 验证检测、转发、参数与发布（`node --test test/bridge.test.mjs`） |
+| `test/bridge.test.mjs` | 用假 agy 验证检测、自定义路径、转发、参数与发布（`node --test test/bridge.test.mjs`） |
 
 ## 检测规则
 
-查找顺序（取第一个找到的）：`PATH` 中的 `agy` → Windows 的 `%LOCALAPPDATA%\agy\bin`（agy 1.5.12 实测位置）→
+若用户在设置页填写了自定义路径（保存在本机配置目录的 `cindy-agy-acp/config.json`，插件升级后保留），
+检测、登录、模型探测、用量查询与任务执行一律使用该路径，不再回退到 `PATH`。留空时按默认顺序自动查找（取第一个找到的）：
+`PATH` 中的 `agy` → Windows 的 `%LOCALAPPDATA%\agy\bin`（agy 1.5.12 实测位置）→
 `~/.npmrc` 的全局目录与常见全局安装位置（macOS / Linux 含 `~/.agy/bin`、`~/.local/bin`、`/usr/local/bin`、
 `/opt/homebrew/bin`）。找到后运行 `agy --version`（10 秒超时）：能运行发布「可用」及版本，找不到发布
 `not-installed`，运行失败发布 `not-runnable`；读取模型时 agy 要求登录则发布 `not-signed-in`。发布给 Cindy 的
@@ -150,7 +152,7 @@ node --test test/bridge.test.mjs
 
 ## 已知限制
 
-- macOS / Linux 上 agy 的默认安装位置未实机验证；不在上述位置时，请把 `agy` 所在目录加进 PATH。
+- macOS / Linux 上 agy 的默认安装位置未实机验证；不在上述位置时，可以在插件设置页配置自定义 `agy` 路径，或把 `agy` 所在目录加进 PATH。
 - 未登录在读取模型（Cindy 启动、打开模型选择器）或打开设置页时发现；在终端里登出后，Cindy 要到下次检查才知道。
 - 只提供 Google 个人账号登录；agy 公布的 Gemini Enterprise、Gemini API Key（按量计费）、Agent Platform 登录方式没有接入。
 - agy 在任务中自己切换模式时（例如规划结束后），Cindy 的权限菜单不会跟着变。

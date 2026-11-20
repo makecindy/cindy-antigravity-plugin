@@ -38,6 +38,11 @@ if (args.length === 1 && args[0] === '--version') {
   process.stdout.write('agy ' + (process.env.FAKE_AGY_VERSION || '0.2.2') + '\\n');
   process.exit(0);
 }
+if (args.includes('/usage')) {
+  process.stdout.write(JSON.stringify({ status: 'SUCCESS', num_turns: 0,
+    command: { name: 'usage', data: { groups: [{ name: process.env.FAKE_AGY_VERSION || '0.2.2', buckets: [{ window: '5h', remaining_fraction: 0.75 }] }] } } }));
+  process.exit(0);
+}
 // Remote-workspace mode: the session process runs under the restricted agent of its working directory.
 const REMOTE_ARGS = ${JSON.stringify(JSON.stringify([...EXPECTED_ACP_ARGS, '--agent', 'cindy-remote']))};
 if (JSON.stringify(args) === REMOTE_ARGS) {
@@ -92,11 +97,12 @@ if (JSON.stringify(args) === REMOTE_ARGS) {
   process.stdin.on('end', () => process.stdout.write('', () => process.exit(0)));
   return;
 }
-// The arguments Cindy's entry must use: session settings (no paid credits), ACP, no telemetry.
+// Every launch must pass the constant ACP args (including no paid credits and no telemetry).
 if (JSON.stringify(args) !== ${JSON.stringify(JSON.stringify(EXPECTED_ACP_ARGS))}) {
   process.stderr.write('fake-agy: unexpected arguments ' + JSON.stringify(args) + '\\n');
   process.exit(2);
 }
+if (process.env.FAKE_AGY_ARGSFILE) fs.writeFileSync(process.env.FAKE_AGY_ARGSFILE, JSON.stringify(args));
 if (process.env.FAKE_AGY_PIDFILE) fs.writeFileSync(process.env.FAKE_AGY_PIDFILE, String(process.pid));
 process.stderr.write('fake-agy: ready\\n');
 const STATE = process.env.FAKE_AGY_STATE;
@@ -132,6 +138,10 @@ if (STATE) {
       } else if (method === 'session/list' || method === 'session/resume') {
         if (!signedIn()) authRequired(id);
         else send({ id, result: method === 'session/list' ? { sessions: [] } : { _meta: TIER } });
+      } else if (method === 'session/new') {
+        if (!signedIn()) authRequired(id);
+        else send({ id, result: { sessionId: 'fake-session', configOptions: [{ id: 'model', category: 'model', type: 'select', currentValue: 'fake-model',
+          options: [{ value: 'fake-model', name: 'Fake ' + (process.env.FAKE_AGY_VERSION || '0.2.2') }] }] } });
       } else {
         send({ id, result: {} });
       }
@@ -976,6 +986,367 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
     assert.equal(code, 127);
     assert.equal(bridge.stdout.bytes().length, 0);
     assert.match(bridge.stderr.text(), /^\[agy-acp\] [^\n]*https:\/\/antigravity\.google[^\n]*\n$/);
+  });
+
+  test('custom agy path is shared by detect, account, login, listModels, usage, and agy-acp, and blocks unsafe fallbacks', async (t) => {
+    const stateFile = path.join(os.tmpdir(), `agy-custom-state-${process.pid}-${Date.now()}`);
+    t.after(() => {
+      fs.rmSync(stateFile, { force: true });
+      fs.rmSync(stateFile + '.log', { force: true });
+    });
+    const fixture = makeFixture(t, { extraEnv: { FAKE_AGY_STATE: stateFile } });
+    const customDir = path.join(fixture.dir, 'custom');
+    fs.mkdirSync(customDir);
+    const customScript = path.join(customDir, 'custom-agy.js');
+    fs.writeFileSync(customScript, FAKE_AGY_SOURCE, 'utf8');
+    const callsFile = path.join(fixture.dir, 'custom.calls');
+    const argsFile = path.join(fixture.dir, 'custom.args');
+    let customBin;
+    let brokenBin;
+    if (isWin) {
+      customBin = path.join(customDir, 'my-agy.cmd');
+      fs.writeFileSync(customBin, `@set FAKE_AGY_VERSION=9.9.9\r\n@echo %*>>"${callsFile}"\r\n@"${process.execPath}" "${customScript}" %*\r\n`);
+      brokenBin = path.join(customDir, 'broken-agy.cmd');
+      fs.writeFileSync(brokenBin, `@set FAKE_AGY_BROKEN=1\r\n@"${process.execPath}" "${customScript}" %*\r\n`);
+    } else {
+      customBin = path.join(customDir, 'my-agy');
+      fs.writeFileSync(customBin, `#!/bin/sh\necho "$@" >> "${callsFile}"\nFAKE_AGY_VERSION=9.9.9 exec "${process.execPath}" "${customScript}" "$@"\n`);
+      fs.chmodSync(customBin, 0o755);
+      brokenBin = path.join(customDir, 'broken-agy');
+      fs.writeFileSync(brokenBin, `#!/bin/sh\nFAKE_AGY_BROKEN=1 exec "${process.execPath}" "${customScript}" "$@"\n`);
+      fs.chmodSync(brokenBin, 0o755);
+    }
+
+    const env = { ...fixture.env, FAKE_AGY_ARGSFILE: argsFile };
+    const worker = startWorker(env);
+    t.after(() => worker.close());
+
+    // Malformed, relative, missing, and non-runnable paths are rejected without saving config.json.
+    const badMissingParam = await worker.call({ jsonrpc: '2.0', id: 1, method: 'setCustomPath', params: {} });
+    assert.deepEqual(badMissingParam.result, { ok: false, error: 'not-absolute' });
+    const badType = await worker.call({ jsonrpc: '2.0', id: 2, method: 'setCustomPath', params: { path: 42 } });
+    assert.deepEqual(badType.result, { ok: false, error: 'not-absolute' });
+    const badRel = await worker.call({ jsonrpc: '2.0', id: 3, method: 'setCustomPath', params: { path: 'agy', locale: 'en' } });
+    assert.deepEqual(badRel.result, { ok: false, error: 'not-absolute' });
+    const badMissing = await worker.call({ jsonrpc: '2.0', id: 4, method: 'setCustomPath', params: { path: path.join(customDir, 'nope'), locale: 'en' } });
+    assert.deepEqual(badMissing.result, { ok: false, error: 'not-found' });
+    const badProbe = await worker.call({ jsonrpc: '2.0', id: 5, method: 'setCustomPath', params: { path: brokenBin, locale: 'en' } });
+    assert.equal(badProbe.result.ok, false);
+    assert.equal(badProbe.result.error, 'not-runnable');
+    const afterFailedSave = await worker.call({ jsonrpc: '2.0', id: 6, method: 'detect', params: { locale: 'en' } });
+    assert.equal(afterFailedSave.result.customPath, undefined);
+    assert.equal(afterFailedSave.result.version, '0.2.2');
+
+    // Saving a quoted custom path succeeds and routes detect, account, login, listModels, usage, and agy-acp to it.
+    const saved = await worker.call({ jsonrpc: '2.0', id: 7, method: 'setCustomPath', params: { path: `"${customBin}"`, locale: 'en' } });
+    assert.equal(saved.result.ok, true);
+    assert.ok(samePath(saved.result.customPath, customBin));
+    assert.equal(saved.result.detection.available, true);
+    assert.equal(saved.result.detection.version, '9.9.9');
+    assert.equal(saved.result.detection.customPathConfigured, true);
+    assert.ok(samePath(saved.result.detection.path, customBin));
+    assert.ok(samePath(saved.result.detection.customPath, customBin));
+
+    // Malformed setCustomPath must NOT clear the saved config.
+    const badTypeAfterSave = await worker.call({ jsonrpc: '2.0', id: 8, method: 'setCustomPath', params: {} });
+    assert.deepEqual(badTypeAfterSave.result, { ok: false, error: 'not-absolute' });
+
+    const acctBefore = await worker.call({ jsonrpc: '2.0', id: 9, method: 'account', params: {} });
+    assert.equal(acctBefore.result.supported, true);
+    assert.equal(acctBefore.result.signedIn, false);
+    const loginRes = await worker.call({ jsonrpc: '2.0', id: 10, method: 'login', params: {} });
+    assert.equal(loginRes.result.ok, true);
+    const modelsRes = await worker.call({ jsonrpc: '2.0', id: 11, method: 'listModels', params: {} });
+    assert.equal(modelsRes.result.supported, true);
+    assert.equal(modelsRes.result.models[0]?.name, 'Fake 9.9.9');
+    const usageRes = await worker.call({ jsonrpc: '2.0', id: 12, method: 'usage', params: {} });
+    assert.equal(usageRes.result.windows[0].label, '9.9.9 · 5h');
+
+    // agy-acp launches the custom binary with constant ACP_ARGS.
+    const bridgeEnv = { ...env };
+    delete bridgeEnv.FAKE_AGY_STATE;
+    const bridge = startBridge(bridgeEnv);
+    bridge.child.stdin.write(INITIALIZE);
+    await waitFor(() => bridge.stdout.bytes().length >= EXPECTED_RESPONSE.length, 8_000, 'custom agy initialize');
+    bridge.child.stdin.end();
+    const { code } = await bridge.closed;
+    assert.equal(code, 0);
+    assert.deepEqual(JSON.parse(fs.readFileSync(argsFile, 'utf8')), EXPECTED_ACP_ARGS);
+    const customCalls = fs.readFileSync(callsFile, 'utf8').trim().split(/\r?\n/);
+    assert.ok(customCalls.length >= 6, `expected detect/account/login/listModels/usage/agy-acp calls, got ${customCalls.length}`);
+
+    // If the configured custom binary is removed, never fall back to PATH and refuse standard install.
+    fs.rmSync(customBin);
+    const missingDetect = await worker.call({ jsonrpc: '2.0', id: 13, method: 'detect', params: { locale: 'en' } });
+    assert.equal(missingDetect.result.available, false);
+    assert.equal(missingDetect.result.reason, 'custom-path-unavailable');
+    assert.equal(missingDetect.result.customPathConfigured, true);
+    assert.equal(missingDetect.result.path, undefined);
+    assert.ok(samePath(missingDetect.result.customPath, customBin));
+    assert.doesNotMatch(missingDetect.result.message, /antigravity\.google/i);
+    const blockedInstall = await worker.call({ jsonrpc: '2.0', id: 14, method: 'cliMaintenance', params: { action: 'install' } });
+    assert.deepEqual(blockedInstall.result, { error: 'custom-path' });
+    const brokenBridge = startBridge(bridgeEnv);
+    const brokenClosed = await brokenBridge.closed;
+    assert.equal(brokenClosed.code, 127);
+    assert.match(brokenBridge.stderr.text(), /configured Antigravity CLI path/);
+
+    // A corrupt config.json also refuses PATH fallback and blocks standard install.
+    const { configFilePath } = await import(pathToFileURL(path.join(root, 'resolve-agy.js')).href);
+    const cfgFile = configFilePath({ env });
+    fs.writeFileSync(cfgFile, '{"customPath":', 'utf8');
+    const corruptDetect = await worker.call({ jsonrpc: '2.0', id: 15, method: 'detect', params: { locale: 'en' } });
+    assert.equal(corruptDetect.result.available, false);
+    assert.equal(corruptDetect.result.reason, 'custom-path-unavailable');
+    assert.equal(corruptDetect.result.customPathConfigured, true);
+    assert.equal(corruptDetect.result.path, undefined);
+    const blockedCorruptInstall = await worker.call({ jsonrpc: '2.0', id: 16, method: 'cliMaintenance', params: { action: 'install' } });
+    assert.deepEqual(blockedCorruptInstall.result, { error: 'custom-path' });
+
+    // Clearing the custom path restores PATH auto-discovery.
+    const cleared = await worker.call({ jsonrpc: '2.0', id: 17, method: 'setCustomPath', params: { path: '', locale: 'en' } });
+    assert.equal(cleared.result.ok, true);
+    assert.equal(cleared.result.customPath, null);
+    assert.equal(cleared.result.detection.available, true);
+    assert.equal(cleared.result.detection.version, '0.2.2');
+    assert.equal(cleared.result.detection.customPath, undefined);
+    assert.ok(samePath(cleared.result.detection.path, fixture.agyPath));
+    await worker.close();
+  });
+
+  test('validateCustomPath and configFilePath enforce Windows drive/UNC, cmd safety, LOCALAPPDATA, and POSIX permissions', async (t) => {
+    const { configFilePath, validateCustomPath } = await import(pathToFileURL(path.join(root, 'resolve-agy.js')).href);
+    assert.deepEqual(validateCustomPath('\\bin\\agy.cmd', { platform: 'win32', env: {} }), { ok: false, error: 'not-absolute' });
+    assert.deepEqual(validateCustomPath('C:bin\\agy.cmd', { platform: 'win32', env: {} }), { ok: false, error: 'not-absolute' });
+    assert.deepEqual(validateCustomPath('C:\\bad%path\\agy.cmd', { platform: 'win32', env: {} }), { ok: false, error: 'unsafe-path' });
+    assert.deepEqual(validateCustomPath('relative/agy', { platform: 'darwin', env: { HOME: '/tmp' } }), { ok: false, error: 'not-absolute' });
+    assert.equal(
+      configFilePath({ platform: 'win32', env: { APPDATA: 'C:\\Users\\a\\AppData\\Roaming', LOCALAPPDATA: 'C:\\Users\\a\\AppData\\Local' } }),
+      'C:\\Users\\a\\AppData\\Local\\cindy-agy-acp\\config.json',
+    );
+    if (!isWin) {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-perm-'));
+      t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+      const plain = path.join(dir, 'agy');
+      fs.writeFileSync(plain, '#!/bin/sh\n', { mode: 0o644 });
+      assert.deepEqual(validateCustomPath(plain, { platform: process.platform, env: {} }), { ok: false, error: 'not-executable' });
+    }
+  });
+
+  test('main.js discards stale detect/listModels from the old binary, refreshes usage, and never leaks paths', async () => {
+    class Channel {
+      static all = [];
+      constructor(name) { this.name = name; this.onmessage = null; Channel.all.push(this); }
+      postMessage(data) {
+        const copy = JSON.parse(JSON.stringify(data));
+        for (const other of Channel.all) {
+          if (other !== this && other.name === this.name && other.onmessage) setTimeout(() => other.onmessage({ data: copy }), 0);
+        }
+      }
+    }
+    const puts = [];
+    const nodeCalls = [];
+    let resolveListA;
+    let resolveDetectA;
+    let listCount = 0;
+    let detectCount = 0;
+    const context = vm.createContext({
+      BroadcastChannel: Channel, setTimeout, clearTimeout,
+      cindy: {
+        request: async () => ({ ok: true, context: { locale: 'en', uiLocale: 'en' } }),
+        node: {
+          request: async (request) => {
+            nodeCalls.push(JSON.parse(JSON.stringify(request)));
+            if (request.method === 'detect') {
+              detectCount += 1;
+              if (detectCount === 1) {
+                return { ok: true, result: { available: true, path: '/bin/agy-a', version: '1.0.0' } };
+              }
+              return new Promise((resolve) => { resolveDetectA = resolve; });
+            }
+            if (request.method === 'listModels') {
+              listCount += 1;
+              if (listCount === 1) return new Promise((resolve) => { resolveListA = resolve; });
+              return { ok: true, result: { supported: true, models: [{ id: 'model-b', name: 'Model B' }], sessionId: 'sess-b' } };
+            }
+            if (request.method === 'setCustomPath') {
+              if (request.params.path === '/missing/agy') {
+                return { ok: true, result: { ok: true, customPath: '/missing/agy', detection: {
+                  available: false, reason: 'custom-path-unavailable', customPath: '/missing/agy', customPathConfigured: true,
+                  message: 'The configured Antigravity CLI path is unavailable. Open the Antigravity plugin settings to update it or switch back to auto-detect.',
+                  messages: { en: 'The configured Antigravity CLI path is unavailable. Open the Antigravity plugin settings to update it or switch back to auto-detect.' },
+                } } };
+              }
+              return { ok: true, result: { ok: true, customPath: '/opt/agy-b', detection: {
+                available: true, path: '/opt/agy-b', customPath: '/opt/agy-b', customPathConfigured: true, version: '2.0.0',
+              } } };
+            }
+            if (request.method === 'usage') {
+              return { ok: true, result: { updatedAt: 1, windows: [{ label: 'B · 5h', remainingPercent: 80 }] } };
+            }
+            return { ok: false };
+          },
+        },
+        onHostMessage: () => () => {},
+      },
+      fetch: async (url, init) => {
+        if (url === '/kv' && !init) return { ok: true, json: async () => ({}) };
+        if (url === '/harnesses') puts.push(JSON.parse(init.body).harnesses[0]);
+        return { ok: true, status: 204 };
+      },
+    });
+    vm.runInContext(fs.readFileSync(path.join(root, 'main.js'), 'utf8'), context, { filename: 'main.js' });
+    await waitFor(() => listCount === 1, 3_000, 'initial listModels for A in flight');
+
+    const page = new Channel('agy-acp');
+    const received = [];
+    page.onmessage = (event) => received.push(event.data);
+
+    // Start a slow detect on A, then switch to B before either detect or listModels(A) settles.
+    page.postMessage({ type: 'detect-request', reqId: 'd-stale' });
+    await waitFor(() => typeof resolveDetectA === 'function', 3_000, 'slow detect A in flight');
+    page.postMessage({ type: 'custom-path-request', reqId: 'p1', path: '/opt/agy-b' });
+    await waitFor(() => received.some((m) => m.type === 'custom-path-result' && m.reqId === 'p1'), 3_000, 'custom-path-result B');
+    await waitFor(() => listCount === 2, 3_000, 'fresh listModels for B');
+
+    // Now release the stale detect(A) and listModels(A); neither may overwrite B.
+    resolveDetectA({ ok: true, result: { available: true, path: '/bin/agy-a', version: '1.0.0' } });
+    resolveListA({ ok: true, result: { supported: true, models: [{ id: 'model-a', name: 'Model A' }], sessionId: 'sess-a' } });
+    await waitFor(() => puts.some((entry) => entry.version === '2.0.0' && entry.models?.[0]?.id === 'model-b'), 3_000, 'published B models');
+    await waitFor(() => received.some((m) => m.type === 'harness-usage' && m.usage?.windows?.[0]?.label === 'B · 5h'), 3_000, 'refreshed usage for B');
+
+    const latest = puts.at(-1);
+    assert.equal(latest.version, '2.0.0');
+    assert.deepEqual(latest.models, [{ id: 'model-b', name: 'Model B' }]);
+    assert.equal(latest.path, undefined);
+    assert.equal(latest.customPath, undefined);
+    assert.ok(!puts.some((entry) => entry.version === '2.0.0' && entry.models?.[0]?.id === 'model-a'), 'never pairs B version with A models');
+
+    // Unavailable custom path publishes a path-free settings message, never an antigravity.google install prompt.
+    page.postMessage({ type: 'custom-path-request', reqId: 'p2', path: '/missing/agy' });
+    await waitFor(() => received.some((m) => m.type === 'custom-path-result' && m.reqId === 'p2'), 3_000, 'unavailable custom path');
+    const unavailablePut = puts.at(-1);
+    assert.equal(unavailablePut.available, false);
+    assert.match(unavailablePut.message, /plugin settings/i);
+    assert.doesNotMatch(unavailablePut.message, /\/missing\/agy|antigravity\.google/i);
+  });
+
+  test('settings.js + cli-settings.js disable unchanged save, re-translate notes, hide install for unavailable custom path, and reset', async () => {
+    class Channel {
+      static all = [];
+      constructor(name) { this.name = name; this.onmessage = null; this.listeners = []; Channel.all.push(this); }
+      addEventListener(type, listener) { if (type === 'message') this.listeners.push(listener); }
+      postMessage(data) {
+        const copy = JSON.parse(JSON.stringify(data));
+        for (const other of Channel.all) {
+          if (other === this || other.name !== this.name) continue;
+          setTimeout(() => {
+            other.onmessage?.({ data: copy });
+            for (const listener of other.listeners) listener({ data: copy });
+          }, 0);
+        }
+      }
+    }
+    const elements = new Map();
+    const element = (id) => {
+      if (!elements.has(id)) {
+        const listeners = {};
+        elements.set(id, { id, value: '', placeholder: '', textContent: '', hidden: false, disabled: false, attributes: {}, dataset: {}, listeners,
+          setAttribute(name, value) { this.attributes[name] = value; },
+          addEventListener(type, listener) { listeners[type] = listener; },
+          focus() {},
+          click() { listeners.click(); } });
+      }
+      return elements.get(id);
+    };
+    let currentLocale = 'en';
+    const context = vm.createContext({
+      BroadcastChannel: Channel, crypto: globalThis.crypto, setTimeout, clearTimeout, setInterval, clearInterval,
+      document: { getElementById: element, documentElement: {}, visibilityState: 'visible', addEventListener() {} },
+      fetch: async (url) => ({ ok: true, json: async () => (url === '/app-context' ? { context: { uiLocale: currentLocale } } : { state: 'on' }) }),
+    });
+    const main = new Channel('agy-acp');
+    const savedPaths = [];
+    const cliActions = [];
+    const account = { signedIn: true, canSignIn: true, canSignOut: true, busy: null };
+    main.onmessage = ({ data }) => {
+      if (data.type === 'detect-request') {
+        main.postMessage({ type: 'detect-ack', reqId: data.reqId });
+        main.postMessage({ type: 'detect-result', reqId: data.reqId, snapshot: { ok: true, account,
+          result: { available: true, version: '1.5.9', path: '/usr/local/bin/agy' }, signInRequired: false, publish: { status: 'published' }, checkedAt: 1 } });
+      }
+      if (data.type === 'cli-state-request') main.postMessage({ type: 'cli-state' });
+      if (data.type === 'cli-maintenance') {
+        cliActions.push(data.action);
+        main.postMessage({ type: 'cli-state', reqId: data.reqId, action: data.action, active: false, result: { state: 'current', version: '1.5.9' } });
+      }
+      if (data.type === 'account-request') {
+        main.postMessage({ type: 'account-ack', reqId: data.reqId });
+        main.postMessage({ type: 'account-result', reqId: data.reqId, op: data.op, account });
+      }
+      if (data.type === 'custom-path-request') {
+        savedPaths.push(data.path);
+        main.postMessage({ type: 'custom-path-ack', reqId: data.reqId });
+        if (data.path === 'bad') {
+          main.postMessage({ type: 'custom-path-result', reqId: data.reqId, ok: false, error: 'not-absolute' });
+        } else if (data.path === '/gone/agy') {
+          main.postMessage({ type: 'custom-path-result', reqId: data.reqId, ok: true, snapshot: { ok: true, account,
+            result: { available: false, reason: 'custom-path-unavailable', customPath: '/gone/agy', customPathConfigured: true },
+            signInRequired: false, publish: { status: 'published' }, checkedAt: 2 } });
+        } else {
+          const customPath = data.path || undefined;
+          main.postMessage({ type: 'custom-path-result', reqId: data.reqId, ok: true, snapshot: { ok: true, account,
+            result: { available: true, version: customPath ? '9.9.9' : '1.5.9', path: customPath || '/usr/local/bin/agy', ...(customPath ? { customPath, customPathConfigured: true } : {}) },
+            signInRequired: false, publish: { status: 'published' }, checkedAt: 3 } });
+        }
+      }
+    };
+    context.window = context;
+    vm.runInContext(fs.readFileSync(path.join(root, 'cli-settings.js'), 'utf8'), context, { filename: 'cli-settings.js' });
+    vm.runInContext(fs.readFileSync(path.join(root, 'settings.js'), 'utf8'), context, { filename: 'settings.js' });
+
+    await waitFor(() => element('version').textContent === '1.5.9', 3_000, 'initial detect');
+    assert.equal(element('custom-path-reset').hidden, true);
+    assert.equal(element('custom-path-save').disabled, true, 'Save is disabled when unchanged');
+
+    // IME Enter must not submit; typing enables Save and invalid path surfaces inline error that re-translates on locale change.
+    element('custom-path-input').value = 'bad';
+    element('custom-path-input').listeners.input();
+    assert.equal(element('custom-path-save').disabled, false);
+    element('custom-path-input').listeners.keydown({ key: 'Enter', isComposing: true });
+    assert.deepEqual(savedPaths, []);
+    element('custom-path-save').click();
+    await waitFor(() => element('custom-path-note').textContent.includes('absolute path'), 3_000, 'validation error');
+    assert.equal(element('custom-path-note').attributes['data-tone'], 'error');
+    currentLocale = 'zh-CN';
+    main.postMessage({ type: 'locale-changed' });
+    await waitFor(() => element('custom-path-note').textContent.includes('绝对路径'), 3_000, 'note re-translated to zh-CN');
+    currentLocale = 'en';
+    main.postMessage({ type: 'locale-changed' });
+    await waitFor(() => element('custom-path-note').textContent.includes('absolute path'), 3_000, 'note re-translated back to en');
+
+    // Valid path updates version, triggers a fresh CLI update check, and shows Reset button.
+    element('custom-path-input').value = '/opt/custom/agy';
+    element('custom-path-input').listeners.input();
+    element('custom-path-save').click();
+    await waitFor(() => element('version').textContent === '9.9.9', 3_000, 'saved custom path');
+    await waitFor(() => cliActions.filter((a) => a === 'check').length >= 1, 3_000, 'CLI update check re-ran after path change');
+    assert.equal(element('custom-path-reset').hidden, false);
+    assert.equal(element('custom-path-save').disabled, true);
+
+    // Unavailable custom path hides "Install from official source" and shows Path unavailable badge.
+    element('custom-path-input').value = '/gone/agy';
+    element('custom-path-input').listeners.input();
+    element('custom-path-save').click();
+    await waitFor(() => element('badge').textContent === 'Path unavailable', 3_000, 'unavailable badge');
+    assert.equal(element('cli-action').hidden, true, 'Install button is hidden when custom path is unavailable');
+    assert.equal(element('custom-path-reset').hidden, false);
+
+    // Reset sends empty path and restores auto-detection.
+    element('custom-path-reset').click();
+    await waitFor(() => element('version').textContent === '1.5.9', 3_000, 'reset to auto-detect');
+    assert.equal(element('custom-path-reset').hidden, true);
+    assert.deepEqual(savedPaths, ['bad', '/opt/custom/agy', '/gone/agy', '']);
   });
 });
 
