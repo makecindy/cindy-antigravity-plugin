@@ -114,7 +114,7 @@ agy --settings {"useG1Credits":false} acp --disable-telemetry
 | `agy-client.js` | 插件自用的短时 ACP 连接（启动 agy、`initialize`、调用、停止） |
 | `agy-models.js` | 经 ACP 读取模型、每个模型的思考深度、agy 的工作模式与订阅档位 |
 | `agy-account.js` | 经 ACP 查询登录状态、用 Google 登录、取消登录、退出登录 |
-| `agy-acp.js` | ACP 引擎入口：启动 `agy acp`，双向原样转发 stdio |
+| `agy-acp.js` | ACP 引擎入口：启动 `agy acp`，本机模式下为 agy 1.5.13+ 的 `initialize` 补齐 HTTP MCP 能力后按字节原样转发 stdio |
 | `remote-workspace.js` | 任务文件在另一台电脑时：受限 Agent 的定义、两段式启动，以及读懂 ACP 的转接 |
 | `settings.html` / `settings.js` | 设置页：检测结果、版本、位置、安装提示、账号（登录 / 退出）与「重新检测」 |
 | `locales/` | 清单名称与说明的英文、简体中文文案 |

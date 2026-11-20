@@ -4,9 +4,10 @@
  * ACP engine entry for Cindy (`harnesses[].entry`).
  *
  * Cindy starts this file in raw-stdio mode, one process per task. It starts the
- * locally installed `agy acp` (session settings: no paid credits, no telemetry) and relays bytes unchanged:
- *   stdin  -> agy stdin    (ACP JSON-RPC from Cindy)
- *   agy stdout -> stdout   (ACP JSON-RPC to Cindy; this file never writes stdout itself)
+ * locally installed `agy acp` (session settings: no paid credits, no telemetry) and relays ACP traffic:
+ *   stdin  -> agy stdin    (ACP JSON-RPC from Cindy, unchanged)
+ *   agy stdout -> stdout   (ACP JSON-RPC to Cindy; patches `initialize` to add
+ *                           `agentCapabilities.mcpCapabilities.http = true`, then relays bytes unchanged)
  *   agy stderr -> stderr   (diagnostics, ends up in the plugin log)
  * When Cindy closes stdin, agy's stdin is closed and agy exits on its own; when agy
  * exits, this process exits with the same code. When this process is asked to stop,
@@ -19,6 +20,7 @@
  */
 
 const os = require('node:os');
+const { Transform } = require('node:stream');
 const { ACP_ARGS, detectAgy, resolveAgy, spawnAgy, killTree } = require('./resolve-agy.js');
 const remoteWorkspace = require('./remote-workspace.js');
 
@@ -28,6 +30,42 @@ const STDIN_END_GRACE_MS = 5_000;
 const SIGNAL_GRACE_MS = 1_500;
 const FLUSH_TIMEOUT_MS = 2_000;
 const NOT_FOUND_EXIT_CODE = 127;
+/** Cap buffered handshake bytes while waiting for the single initialize response. */
+const MAX_HANDSHAKE_LINE_BYTES = 1024 * 1024;
+/** Stop inspecting stdout lines once this many lines pass without matching initialize. */
+const MAX_HANDSHAKE_LINES = 32;
+const NEWLINE = Buffer.from('\n');
+
+function parseJsonObject(line) {
+  try {
+    const parsed = JSON.parse(line.toString('utf8'));
+    return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * agy 1.5.13+ connects to HTTP MCP servers passed in session/new without advertising
+ * `agentCapabilities.mcpCapabilities.http`. Gate on the checked agy version and fill it
+ * in only when omitted so older CLIs and explicit `http: false` declarations are preserved.
+ */
+function completeLocalInitializeResult(result) {
+  const version = result.agentInfo && typeof result.agentInfo === 'object' && !Array.isArray(result.agentInfo)
+    ? result.agentInfo.version
+    : undefined;
+  if (!remoteWorkspace.versionSupported(version)) {
+    return result;
+  }
+  const capabilities = result.agentCapabilities;
+  const mcp = capabilities && typeof capabilities === 'object' && !Array.isArray(capabilities)
+    ? capabilities.mcpCapabilities
+    : undefined;
+  if (mcp && typeof mcp === 'object' && !Array.isArray(mcp) && typeof mcp.http === 'boolean') {
+    return result;
+  }
+  return remoteWorkspace.completeInitializeResult(result);
+}
 
 function exitAfterStderr(line, code) {
   let done = false;
@@ -68,18 +106,37 @@ function run(agyPath) {
   let finished = false;
   let stopCode = null;
   let forceTimer = null;
+  let stdoutRelay = null;
 
   const finish = (code) => {
     if (finished) return;
     finished = true;
     clearTimeout(forceTimer);
     process.stdin.unpipe(child.stdin);
-    const done = () => process.exit(code);
-    if (process.stdout.writableLength > 0) {
-      process.stdout.once('drain', done);
-      setTimeout(done, FLUSH_TIMEOUT_MS);
+    let exited = false;
+    let flushTimer = null;
+    const done = () => {
+      if (exited) return;
+      exited = true;
+      clearTimeout(flushTimer);
+      process.exit(code);
+    };
+    const flushStdout = () => {
+      if (process.stdout.writableLength > 0) {
+        try {
+          process.stdout.write('', done);
+        } catch {
+          done();
+        }
+      } else {
+        done();
+      }
+    };
+    flushTimer = setTimeout(done, FLUSH_TIMEOUT_MS);
+    if (stopCode !== null || !stdoutRelay || stdoutRelay.readableEnded || stdoutRelay.destroyed) {
+      flushStdout();
     } else {
-      done();
+      stdoutRelay.once('end', flushStdout);
     }
   };
 
@@ -125,12 +182,158 @@ function run(agyPath) {
     });
   });
 
-  // Byte-for-byte relay. No encoding is set anywhere, so chunks stay Buffers.
+  // Backpressure-aware relay: completes the single `initialize` response with
+  // `mcpCapabilities.http: true` when omitted so Cindy passes its local HTTP MCP bridge
+  // (cindy_helper, cindy_orca, orca_worker_bridge) to agy, then passes all chunks raw.
+  let initId;
+  let initSettled = false;
+  let stdinPending = [];
+  let stdinPendingBytes = 0;
+  let stdinOversized = false;
+
+  const onStdinData = (chunk) => {
+    if (initSettled || initId !== undefined) return;
+    let start = 0;
+    let index;
+    while ((index = chunk.indexOf(0x0a, start)) !== -1) {
+      const piece = chunk.subarray(start, index);
+      start = index + 1;
+      if (stdinOversized) {
+        stdinOversized = false;
+        stdinPending = [];
+        stdinPendingBytes = 0;
+        continue;
+      }
+      const line = stdinPending.length ? Buffer.concat([...stdinPending, piece]) : piece;
+      stdinPending = [];
+      stdinPendingBytes = 0;
+      if (!line.length) continue;
+      const message = parseJsonObject(line);
+      if (message && message.method === 'initialize' && message.id !== undefined) {
+        initId = message.id;
+        process.stdin.off('data', onStdinData);
+        return;
+      }
+      if (message && typeof message.method === 'string' && message.method !== 'initialize') {
+        initSettled = true;
+        process.stdin.off('data', onStdinData);
+        return;
+      }
+    }
+    if (start < chunk.length && !stdinOversized) {
+      const rest = chunk.subarray(start);
+      stdinPendingBytes += rest.length;
+      if (stdinPendingBytes > MAX_HANDSHAKE_LINE_BYTES) {
+        stdinOversized = true;
+        stdinPending = [];
+        stdinPendingBytes = 0;
+      } else {
+        stdinPending.push(rest);
+      }
+    }
+  };
+
+  let stdoutPending = [];
+  let stdoutPendingBytes = 0;
+  let stdoutOversized = false;
+  let stdoutInspectedLines = 0;
+  stdoutRelay = new Transform({
+    transform(chunk, _encoding, callback) {
+      if (initSettled) {
+        if (stdoutPending.length) {
+          this.push(Buffer.concat(stdoutPending));
+          stdoutPending = [];
+          stdoutPendingBytes = 0;
+        }
+        callback(null, chunk);
+        return;
+      }
+      let start = 0;
+      let index;
+      while ((index = chunk.indexOf(0x0a, start)) !== -1) {
+        const piece = chunk.subarray(start, index);
+        start = index + 1;
+        if (stdoutOversized) {
+          stdoutOversized = false;
+          this.push(Buffer.concat([piece, NEWLINE]));
+          stdoutInspectedLines += 1;
+          if (stdoutInspectedLines >= MAX_HANDSHAKE_LINES) {
+            initSettled = true;
+            process.stdin.off('data', onStdinData);
+            stdinPending = [];
+            stdinPendingBytes = 0;
+            if (start < chunk.length) this.push(chunk.subarray(start));
+            callback();
+            return;
+          }
+          continue;
+        }
+        const line = stdoutPending.length ? Buffer.concat([...stdoutPending, piece]) : piece;
+        stdoutPending = [];
+        stdoutPendingBytes = 0;
+        stdoutInspectedLines += 1;
+        const message = line.length ? parseJsonObject(line) : null;
+        if (message && initId !== undefined && message.id === initId && !('method' in message)) {
+          initSettled = true;
+          process.stdin.off('data', onStdinData);
+          stdinPending = [];
+          stdinPendingBytes = 0;
+          if (message.result && typeof message.result === 'object' && !Array.isArray(message.result)) {
+            const completed = { ...message, result: completeLocalInitializeResult(message.result) };
+            this.push(Buffer.from(JSON.stringify(completed) + '\n', 'utf8'));
+          } else {
+            this.push(Buffer.concat([line, NEWLINE]));
+          }
+          if (start < chunk.length) this.push(chunk.subarray(start));
+          callback();
+          return;
+        }
+        this.push(Buffer.concat([line, NEWLINE]));
+        if (stdoutInspectedLines >= MAX_HANDSHAKE_LINES) {
+          initSettled = true;
+          process.stdin.off('data', onStdinData);
+          stdinPending = [];
+          stdinPendingBytes = 0;
+          if (start < chunk.length) this.push(chunk.subarray(start));
+          callback();
+          return;
+        }
+      }
+      if (start < chunk.length) {
+        const rest = chunk.subarray(start);
+        if (stdoutOversized) {
+          this.push(rest);
+        } else if (stdoutPendingBytes + rest.length > MAX_HANDSHAKE_LINE_BYTES) {
+          stdoutOversized = true;
+          if (stdoutPending.length) {
+            this.push(Buffer.concat(stdoutPending));
+            stdoutPending = [];
+            stdoutPendingBytes = 0;
+          }
+          this.push(rest);
+        } else {
+          stdoutPending.push(rest);
+          stdoutPendingBytes += rest.length;
+        }
+      }
+      callback();
+    },
+    flush(callback) {
+      if (stdoutPending.length) {
+        this.push(Buffer.concat(stdoutPending));
+        stdoutPending = [];
+        stdoutPendingBytes = 0;
+      }
+      callback();
+    },
+  });
+
+  process.stdin.on('data', onStdinData);
   process.stdin.pipe(child.stdin);
   child.stdin.on('error', () => {
     // EPIPE after agy exited; the exit handler takes care of shutting down.
   });
-  child.stdout.pipe(process.stdout, { end: false });
+  child.stdout.pipe(stdoutRelay).pipe(process.stdout, { end: false });
   child.stderr.pipe(process.stderr, { end: false });
 
   process.stdin.on('end', () => {
