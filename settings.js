@@ -71,6 +71,7 @@
       customPathCleared: '已恢复自动检测。',
       customPathUnavailableNote: '当前自定义路径不可用，请修改路径或点「恢复自动」。',
       customPathErrors: {
+        busy: '请等 CLI 安装或更新完成后再修改路径。',
         'not-absolute': '请填写有效的绝对路径。',
         'not-found': '找不到这个文件，请检查路径。',
         'not-executable': '这个文件不可执行，请检查权限。',
@@ -134,6 +135,7 @@
       customPathCleared: 'Switched back to auto-detect.',
       customPathUnavailableNote: 'The configured custom path is unavailable. Update it or switch back to auto-detect.',
       customPathErrors: {
+        busy: 'Wait for the CLI install or update to finish before changing the path.',
         'not-absolute': 'Enter a valid absolute path to the agy executable.',
         'not-found': 'File not found. Check the path and try again.',
         'not-executable': 'This file is not executable. Check its permissions.',
@@ -155,6 +157,7 @@
   var customPathPending = null;
   var customPathDirty = false;
   var customPathNote = null;
+  var cliBusy = false;
   /** Last account view from main.js: { signedIn, tier?, canSignIn, canSignOut, busy }. */
   var accountState = null;
   /** Account requests waiting for main.js, by reqId: { reqId, op, acked, sends, resend, deadline }. */
@@ -275,15 +278,16 @@
     var input = $('custom-path-input');
     input.placeholder = t.customPathPlaceholder;
     if (!customPathDirty && !customPathPending) input.value = activeCustom;
-    input.disabled = Boolean(customPathPending);
+    var locked = Boolean(customPathPending) || cliBusy;
+    input.disabled = locked;
     var currentVal = (input.value || '').trim();
     var unchanged = currentVal === activeCustom && !(configured && !activeCustom);
     var saveBtn = $('custom-path-save');
     saveBtn.textContent = customPathPending ? t.customPathSaving : t.customPathSave;
-    saveBtn.disabled = Boolean(customPathPending) || unchanged;
+    saveBtn.disabled = locked || unchanged;
     var resetBtn = $('custom-path-reset');
     resetBtn.textContent = t.customPathReset;
-    resetBtn.disabled = Boolean(customPathPending);
+    resetBtn.disabled = locked;
     show('custom-path-reset', configured);
     var activeNote = customPathNote || (result && result.reason === 'custom-path-unavailable' ? { key: 'unavailable', tone: 'error' } : null);
     var noteEl = $('custom-path-note');
@@ -474,12 +478,24 @@
     });
   }
 
+  function clearAccountRequests() {
+    for (var id in accountRequests) {
+      if (!Object.prototype.hasOwnProperty.call(accountRequests, id)) continue;
+      clearInterval(accountRequests[id].resend);
+      clearTimeout(accountRequests[id].deadline);
+      delete accountRequests[id];
+    }
+    accountNote = null;
+    confirmingLogout = false;
+  }
+
   function settleCustomPath(state, message, fallbackErrorKey) {
     if (customPathPending !== state) return;
     customPathPending = null;
     clearInterval(state.resend);
     clearTimeout(state.deadline);
     if (message && message.ok && message.snapshot && typeof message.snapshot === 'object') {
+      clearAccountRequests();
       snapshot = message.snapshot;
       error = message.snapshot.ok ? null : { key: 'detectFailed', text: message.snapshot.error };
       if (message.snapshot.account && typeof message.snapshot.account === 'object') accountState = message.snapshot.account;
@@ -563,10 +579,16 @@
         }
         return;
       }
+      if (data.type === 'cli-state') {
+        cliBusy = Boolean(data.active && data.action !== 'check');
+        renderCustomPath();
+        return;
+      }
       if (data.type === 'custom-path-result') {
         if (customPathPending && data.reqId === customPathPending.reqId) {
           settleCustomPath(customPathPending, data);
         } else if (!customPathPending && data.ok && data.snapshot && data.snapshot.result) {
+          clearAccountRequests();
           snapshot = data.snapshot;
           error = data.snapshot.ok ? null : { key: 'detectFailed', text: data.snapshot.error };
           if (data.snapshot.account && typeof data.snapshot.account === 'object') accountState = data.snapshot.account;
@@ -610,6 +632,7 @@
     if (!$('custom-path-save').disabled) requestCustomPath($('custom-path-input').value || '');
   });
   $('custom-path-reset').addEventListener('click', function () {
+    if ($('custom-path-reset').disabled) return;
     $('custom-path-input').value = '';
     customPathDirty = false;
     requestCustomPath('');

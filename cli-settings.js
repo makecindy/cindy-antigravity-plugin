@@ -201,6 +201,9 @@ window.createCliMaintenance = function (channel, refresh, refreshId) {
     if (data.progress && Array.isArray(data.progress.log)) {
       progress = data.progress;
       progressAt = Date.now();
+    } else if (!data.active && !data.result) {
+      progress = null;
+      shownLog = '';
     }
     pending = data.active ? data : undefined;
     if (pending) checkRequested = false;
@@ -243,7 +246,11 @@ window.createCliMaintenance = function (channel, refresh, refreshId) {
       status.version !== local.version || status.reason !== local.reason ||
       status.path !== local.path || status.customPath !== local.customPath
     ));
-    if (changed && result?.state !== 'installed') {
+    const sameInstalled = result?.state === 'installed'
+      && Boolean(status && status.available && status.version === result.version)
+      && (status.customPath || '') === (local?.customPath || '')
+      && (!local?.path || status.path === local.path);
+    if (changed && !sameInstalled) {
       result = undefined;
       if (status.available) checkRequested = true;
     }

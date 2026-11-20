@@ -1347,6 +1347,177 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
     await waitFor(() => element('version').textContent === '1.5.9', 3_000, 'reset to auto-detect');
     assert.equal(element('custom-path-reset').hidden, true);
     assert.deepEqual(savedPaths, ['bad', '/opt/custom/agy', '/gone/agy', '']);
+
+    // After installing A, selecting an older B clears "Installed" and triggers a fresh update check;
+    // active install/update locks the custom path controls.
+    const checksBefore = cliActions.filter((a) => a === 'check').length;
+    main.postMessage({ type: 'cli-state', reqId: 'inst-1', action: 'update', active: true });
+    await waitFor(() => element('custom-path-input').disabled === true, 3_000, 'path locked during update');
+    assert.equal(element('custom-path-save').disabled, true);
+    assert.equal(element('custom-path-reset').disabled, true);
+    main.postMessage({ type: 'cli-state', reqId: 'inst-1', action: 'update', active: false, result: { state: 'installed', version: '2.0.0' } });
+    await waitFor(() => element('cli-status').textContent === 'Installed 2.0.0', 3_000, 'installed status shown');
+    assert.equal(element('custom-path-input').disabled, false);
+
+    element('custom-path-input').value = '/opt/older/agy';
+    element('custom-path-input').listeners.input();
+    element('custom-path-save').click();
+    await waitFor(() => cliActions.filter((a) => a === 'check').length > checksBefore, 3_000, 'fresh check triggered after switching from installed binary');
+    assert.notEqual(element('cli-status').textContent, 'Installed 2.0.0');
+  });
+
+  test('worker.js serializes overlapping setCustomPath calls and cancels active login on path switch', async (t) => {
+    const stateFile = path.join(os.tmpdir(), `agy-serial-state-${process.pid}-${Date.now()}`);
+    t.after(() => {
+      fs.rmSync(stateFile, { force: true });
+      fs.rmSync(stateFile + '.log', { force: true });
+    });
+    const fixture = makeFixture(t, { extraEnv: { FAKE_AGY_STATE: stateFile, FAKE_AGY_LOGIN: 'hang' } });
+    const dir = path.join(fixture.dir, 'bins');
+    fs.mkdirSync(dir);
+    const script = path.join(dir, 'fake.js');
+    fs.writeFileSync(script, FAKE_AGY_SOURCE, 'utf8');
+    let binA;
+    let binB;
+    if (isWin) {
+      binA = path.join(dir, 'agy-a.cmd');
+      fs.writeFileSync(binA, `@set FAKE_AGY_VERSION=1.1.1\r\n@"${process.execPath}" -e "setTimeout(()=>{}, 150)"\r\n@"${process.execPath}" "${script}" %*\r\n`);
+      binB = path.join(dir, 'agy-b.cmd');
+      fs.writeFileSync(binB, `@set FAKE_AGY_VERSION=2.2.2\r\n@set FAKE_AGY_LOGIN=\r\n@"${process.execPath}" "${script}" %*\r\n`);
+    } else {
+      binA = path.join(dir, 'agy-a');
+      fs.writeFileSync(binA, `#!/bin/sh\nsleep 0.15\nFAKE_AGY_VERSION=1.1.1 exec "${process.execPath}" "${script}" "$@"\n`);
+      fs.chmodSync(binA, 0o755);
+      binB = path.join(dir, 'agy-b');
+      fs.writeFileSync(binB, `#!/bin/sh\nFAKE_AGY_VERSION=2.2.2 FAKE_AGY_LOGIN= exec "${process.execPath}" "${script}" "$@"\n`);
+      fs.chmodSync(binB, 0o755);
+    }
+
+    const worker = startWorker(fixture.env);
+    t.after(() => worker.close());
+
+    // Start a hanging login on the default binary, then fire overlapping saves A (slow) and B (fast).
+    const loginPending = worker.call({ jsonrpc: '2.0', id: 1, method: 'login', params: {} });
+    await waitFor(() => fs.existsSync(stateFile + '.log') && fs.readFileSync(stateFile + '.log', 'utf8').includes('authenticate:oauth-personal'), 5_000, 'login started');
+
+    const saveA = worker.call({ jsonrpc: '2.0', id: 2, method: 'setCustomPath', params: { path: binA, locale: 'en' } });
+    const saveB = worker.call({ jsonrpc: '2.0', id: 3, method: 'setCustomPath', params: { path: binB, locale: 'en' } });
+    const [loginResult, resA, resB] = await Promise.all([loginPending, saveA, saveB]);
+    assert.deepEqual(loginResult.result, { ok: false, error: 'cancelled' });
+    assert.equal(resA.result.ok, true);
+    assert.equal(resA.result.detection.version, '1.1.1');
+    assert.equal(resB.result.ok, true);
+    assert.equal(resB.result.detection.version, '2.2.2');
+
+    const finalDetect = await worker.call({ jsonrpc: '2.0', id: 4, method: 'detect', params: { locale: 'en' } });
+    assert.equal(finalDetect.result.version, '2.2.2');
+    assert.ok(samePath(finalDetect.result.customPath, binB));
+
+    // A new login on B must succeed right away (never stuck as 'busy').
+    const loginB = await worker.call({ jsonrpc: '2.0', id: 5, method: 'login', params: {} });
+    assert.equal(loginB.result.ok, true);
+  });
+
+  test('main.js serializes saves, drops stale login after path switch, and blocks path changes during update', async () => {
+    class Channel {
+      static all = [];
+      constructor(name) { this.name = name; this.onmessage = null; Channel.all.push(this); }
+      postMessage(data) {
+        const copy = JSON.parse(JSON.stringify(data));
+        for (const other of Channel.all) {
+          if (other !== this && other.name === this.name && other.onmessage) setTimeout(() => other.onmessage({ data: copy }), 0);
+        }
+      }
+    }
+    const puts = [];
+    const cancels = [];
+    let resolveLoginA;
+    let resolveSaveA;
+    let resolveUpdate;
+    let loginCalls = 0;
+    const context = vm.createContext({
+      BroadcastChannel: Channel, setTimeout, clearTimeout,
+      cindy: {
+        request: async () => ({ ok: true, context: { locale: 'en', uiLocale: 'en' } }),
+        node: {
+          request: async (request) => {
+            if (request.method === 'detect') return { ok: true, result: { available: true, path: '/bin/agy', version: '1.0.0' } };
+            if (request.method === 'listModels') return { ok: true, result: { supported: true, models: [{ id: 'm', name: 'M' }] } };
+            if (request.method === 'usage') return { ok: true, result: null };
+            if (request.method === 'login') {
+              loginCalls += 1;
+              if (loginCalls === 1) return new Promise((resolve) => { resolveLoginA = resolve; });
+              return { ok: true, result: { ok: true, tier: { name: 'New Tier' } } };
+            }
+            if (request.method === 'cancelLogin') {
+              cancels.push(true);
+              return { ok: true, result: { ok: true, cancelled: true } };
+            }
+            if (request.method === 'setCustomPath') {
+              if (request.params.path === '/opt/agy-a') {
+                return new Promise((resolve) => {
+                  resolveSaveA = () => resolve({ ok: true, result: { ok: true, customPath: '/opt/agy-a',
+                    detection: { available: true, path: '/opt/agy-a', customPath: '/opt/agy-a', customPathConfigured: true, version: '1.5.0' } } });
+                });
+              }
+              return { ok: true, result: { ok: true, customPath: '/opt/agy-b',
+                detection: { available: true, path: '/opt/agy-b', customPath: '/opt/agy-b', customPathConfigured: true, version: '2.0.0' } } };
+            }
+            if (request.method === 'cliMaintenance' && request.params.action === 'update') {
+              return new Promise((resolve) => {
+                resolveUpdate = () => resolve({ ok: true, result: { state: 'installed', version: '2.1.0' } });
+              });
+            }
+            return { ok: false };
+          },
+        },
+        onHostMessage: () => () => {},
+      },
+      fetch: async (url, init) => {
+        if (url === '/kv' && !init) return { ok: true, json: async () => ({}) };
+        if (url === '/harnesses') puts.push(JSON.parse(init.body).harnesses[0]);
+        return { ok: true, status: 204 };
+      },
+    });
+    vm.runInContext(fs.readFileSync(path.join(root, 'main.js'), 'utf8'), context, { filename: 'main.js' });
+    await waitFor(() => puts.length > 0, 3_000, 'initial publish');
+
+    const page = new Channel('agy-acp');
+    const received = [];
+    page.onmessage = (event) => received.push(event.data);
+
+    // Start login on initial binary, then fire overlapping saves A (slow) and B (fast).
+    page.postMessage({ type: 'account-request', reqId: 'login-a', op: 'login' });
+    await waitFor(() => typeof resolveLoginA === 'function', 3_000, 'login A started');
+
+    page.postMessage({ type: 'custom-path-request', reqId: 'save-a', path: '/opt/agy-a' });
+    page.postMessage({ type: 'custom-path-request', reqId: 'save-b', path: '/opt/agy-b' });
+    await waitFor(() => typeof resolveSaveA === 'function', 3_000, 'save A started');
+    resolveSaveA();
+    await waitFor(() => received.some((m) => m.type === 'custom-path-result' && m.reqId === 'save-b'), 3_000, 'save B finished after A');
+
+    // Final published version must be B (2.0.0), and old login must have been cancelled.
+    assert.equal(puts.at(-1).version, '2.0.0');
+    assert.ok(cancels.length >= 1, 'cancelLogin was called on path switch');
+
+    // Late resolution of A's login must not taint B or block a new login on B.
+    resolveLoginA({ ok: true, result: { ok: true, tier: { name: 'Old Tier' } } });
+    await waitFor(() => received.some((m) => m.type === 'account-result' && m.reqId === 'login-a'), 3_000, 'stale login settled');
+    assert.equal(received.find((m) => m.type === 'account-result' && m.reqId === 'login-a').error, 'cancelled');
+
+    page.postMessage({ type: 'account-request', reqId: 'login-b', op: 'login' });
+    await waitFor(() => received.some((m) => m.type === 'account-result' && m.reqId === 'login-b'), 3_000, 'login B succeeded');
+    const loginBResult = received.find((m) => m.type === 'account-result' && m.reqId === 'login-b');
+    assert.equal(loginBResult.error, undefined);
+    assert.equal(loginBResult.account.tier, 'New Tier');
+
+    // Path changes are rejected with 'busy' while a CLI update is active.
+    page.postMessage({ type: 'cli-maintenance', reqId: 'upd-1', action: 'update', version: '2.1.0' });
+    await waitFor(() => typeof resolveUpdate === 'function', 3_000, 'update active');
+    page.postMessage({ type: 'custom-path-request', reqId: 'save-during-upd', path: '/opt/agy-b' });
+    await waitFor(() => received.some((m) => m.type === 'custom-path-result' && m.reqId === 'save-during-upd'), 3_000, 'blocked during update');
+    assert.equal(received.find((m) => m.type === 'custom-path-result' && m.reqId === 'save-during-upd').error, 'busy');
+    resolveUpdate();
   });
 });
 
