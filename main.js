@@ -224,9 +224,11 @@
     var entry = { id: HARNESS_ID, available: result.available === true && !signInRequired };
     if (entry.available) {
       entry.reportsUsage = true;
-      // Cindy may show agy's one login (worker `accountStatus`). No sign-in methods: agy keeps a single
-      // Google sign-in per computer, so Cindy cannot add Antigravity accounts. Older Cindy drops the field.
-      entry.accounts = { methods: [] };
+      entry.accounts = { methods: result.linuxAccounts ? [{
+        id: 'linux-keyring', kind: 'secret',
+        label: locale === 'zh-CN' ? '复用已有 Linux 钥匙串' : 'Use an existing Linux keyring',
+        secretLabel: locale === 'zh-CN' ? '隔离账号目录的绝对路径' : 'Absolute path to the isolated profile',
+      }] : [] };
     }
     if (entry.available && supportsRemoteWorkspace(result.version)) {
       entry.remoteWorkspace = true;
@@ -279,6 +281,7 @@
       path: shortString(raw.path, 1024),
       customPath: shortString(raw.customPath, 1024),
       customPathConfigured: raw.customPathConfigured === true,
+      linuxAccounts: raw.linuxAccounts === true,
       version: shortString(raw.version, 64),
     };
     if (!result.available) {

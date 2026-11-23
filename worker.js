@@ -20,15 +20,14 @@
  *   account({ sessionId? }) -> { supported: true, signedIn, tier?, canSignIn, canSignOut }
  *      | { supported: false, reason } | { supported: true, error, detail? }
  *   accountStatus({ harnessId, accountDir? }) -> { state: 'signed-in', plan? } | { state: 'signed-out' } | null
- *     Cindy's engine accounts (the engine publishes `accounts: { methods: [] }`): agy's one login and
- *     its tier name as `plan`, read like `account` with the dedicated model-list session the last
- *     listModels used. null when agy is missing, the check fails or takes longer than 20 s, and for
- *     an `accountDir` (the plugin never offers to add accounts).
+ *     Reads the original login or the isolated Linux account Cindy selected.
+ *   accountLogin({ harnessId, accountDir, methodId: 'linux-keyring', secret: sourceProfilePath })
+ *   accountLoginCancel({ harnessId, accountDir? })
  *   adoptModelSession({ sessionId }) -> { ok: true, adopted } | { ok: false, error: 'invalid' | 'busy' }
  *     main.js hands over the model-list session it saved, so accountStatus can read the tier before
  *     the next listing (plugins upgraded from 0.4.x kept it only in main.js). Kept only when the worker
  *     remembers none; starts no agy.
- *   usage({ harnessId }) -> { updatedAt, windows } | null   (agy's native /usage, see agy-usage.js)
+ *   usage({ harnessId, accountDir? }) -> { updatedAt, windows } | null   (agy's native /usage, see agy-usage.js)
  *   login() -> { ok: true, tier? } | { ok: false, error, detail? }
  *     agy's Google sign-in: agy opens the browser; answers when the sign-in finished, was cancelled
  *     or after 5 minutes. Sends a `progress` notification every 10 s meanwhile (keeps Cindy's
@@ -49,6 +48,7 @@ const maintain = require('./cli-installer.cjs');
 const { detectAgy, readCustomAgyConfig, runVersion, validateCustomPath, writeCustomAgyPath } = require('./resolve-agy.js');
 const { listModels, readModelSession, rememberModelSession } = require('./agy-models.js');
 const account = require('./agy-account.js');
+const { accountOptions, importAccount, linuxAccountsSupported } = require('./agy-linux-accounts.js');
 
 const HARNESS_ID = 'agy';
 /** Cindy waits 26 s for accountStatus; answer "unknown" before that rather than not at all. */
@@ -71,12 +71,61 @@ function withDeadline(promise, ms, fallback) {
   return Promise.race([promise, expired]).finally(() => clearTimeout(timer));
 }
 
-let usageRead;
-let accountStatusRead;
+const usageReads = new Map();
+const accountStatusReads = new Map();
 let maintenanceActive = false;
 let customPathPending = 0;
 let customPathQueue = Promise.resolve();
-let activeLoginPromise = null;
+let activeLogin = null;
+
+function readOnce(reads, dir, read) {
+  if (!reads.has(dir)) {
+    const pending = Promise.resolve().then(read).catch(() => null).finally(() => {
+      if (reads.get(dir) === pending) reads.delete(dir);
+    });
+    reads.set(dir, pending);
+  }
+  return reads.get(dir);
+}
+
+function validHarness(params) {
+  return params?.harnessId === undefined || params.harnessId === HARNESS_ID;
+}
+
+function login(dir, importPath) {
+  if (customPathPending || activeLogin) return Promise.resolve({ ok: false, error: 'busy' });
+  usageReads.delete(dir);
+  const state = { dir, cancelled: false, run: null };
+  activeLogin = state;
+  state.run = (async () => {
+    if (importPath !== undefined && !await importAccount(dir, importPath)) {
+      return { ok: false, error: 'invalid-secret' };
+    }
+    if (state.cancelled) return { ok: false, error: 'cancelled' };
+    const options = await accountOptions(dir);
+    if (state.cancelled) return { ok: false, error: 'cancelled' };
+    if (importPath !== undefined) {
+      const saved = await withDeadline(account.accountStatus({}, options).catch(() => null), 15_000, null);
+      if (state.cancelled) return { ok: false, error: 'cancelled' };
+      return saved?.state === 'signed-in' ? { ok: true } : { ok: false, error: 'failed' };
+    }
+    return account.login(options, () => {
+      reply({ jsonrpc: '2.0', method: 'progress', params: { stage: 'waiting-for-browser' } });
+    });
+  })().catch(() => ({ ok: false, error: state.cancelled ? 'cancelled' : 'failed' })).finally(() => {
+    if (activeLogin === state) activeLogin = null;
+    accountStatusReads.delete(dir);
+    usageReads.delete(dir);
+  });
+  return state.run;
+}
+
+function cancelLogin(dir) {
+  if (!activeLogin || activeLogin.dir !== dir) return { ok: true, cancelled: false };
+  activeLogin.cancelled = true;
+  account.cancelLogin();
+  return { ok: true, cancelled: true };
+}
 
 async function applyCustomPath(params) {
   if (maintenanceActive) return { ok: false, error: 'busy' };
@@ -90,14 +139,14 @@ async function applyCustomPath(params) {
   if (maintenanceActive) return { ok: false, error: 'busy' };
   const saved = writeCustomAgyPath(params.path);
   if (!saved.ok) return { ok: false, error: saved.error };
-  usageRead = undefined;
-  accountStatusRead = undefined;
+  usageReads.clear();
+  accountStatusReads.clear();
   // Like main.js, start the model listing of the new executable afresh.
   rememberModelSession(null);
-  const pendingLogin = activeLoginPromise;
+  const pendingLogin = activeLogin;
   if (pendingLogin) {
-    account.cancelLogin();
-    await pendingLogin.catch(() => {});
+    cancelLogin(pendingLogin.dir);
+    await pendingLogin.run;
   }
   const detection = await detectAgy({ locale });
   return { ok: true, customPath: saved.customPath, detection };
@@ -117,18 +166,14 @@ const handlers = {
     }
     return result;
   },
-  usage() {
-    if (!usageRead) {
-      const read = require('./agy-usage.js').readUsage().catch(() => null).finally(() => {
-        if (usageRead === read) usageRead = undefined;
-      });
-      usageRead = read;
-    }
-    return usageRead;
+  usage(params) {
+    if (!validHarness(params)) return null;
+    const dir = params?.accountDir;
+    return readOnce(usageReads, dir, async () => require('./agy-usage.js').readUsage(await accountOptions(dir)));
   },
   async detect(params) {
     const locale = params && typeof params.locale === 'string' ? params.locale : undefined;
-    return detectAgy({ locale });
+    return { ...await detectAgy({ locale }), linuxAccounts: linuxAccountsSupported() };
   },
   setCustomPath(params) {
     if (!params || typeof params.path !== 'string') return { ok: false, error: 'not-absolute' };
@@ -145,40 +190,36 @@ const handlers = {
     }));
   },
   accountStatus(params) {
-    if (params && (params.accountDir != null || (params.harnessId !== undefined && params.harnessId !== HARNESS_ID))) {
-      return null;
-    }
-    if (!accountStatusRead) {
-      // Callers share one check (one agy at a time), each with its own deadline.
-      const sessionId = readModelSession();
-      const read = account.accountStatus(sessionId ? { sessionId } : {}).catch(() => null).finally(() => {
-        if (accountStatusRead === read) accountStatusRead = undefined;
-      });
-      accountStatusRead = read;
-    }
-    return withDeadline(accountStatusRead, ACCOUNT_STATUS_DEADLINE_MS, null);
+    if (!validHarness(params)) return null;
+    const dir = params?.accountDir;
+    const pending = readOnce(accountStatusReads, dir, async () => {
+      const options = await accountOptions(dir);
+      const sessionId = dir === undefined ? readModelSession() : null;
+      return account.accountStatus(sessionId ? { sessionId } : {}, options);
+    });
+    return withDeadline(pending, ACCOUNT_STATUS_DEADLINE_MS, null);
   },
   login() {
-    if (customPathPending > 0) return Promise.resolve({ ok: false, error: 'busy' });
-    usageRead = undefined;
-    if (activeLoginPromise) return Promise.resolve({ ok: false, error: 'busy' });
-    const run = Promise.resolve(account.login(undefined, () => {
-      reply({ jsonrpc: '2.0', method: 'progress', params: { stage: 'waiting-for-browser' } });
-    })).finally(() => {
-      if (activeLoginPromise === run) activeLoginPromise = null;
-      // A status read that started before the sign-in finished may describe the old state.
-      accountStatusRead = undefined;
-    });
-    activeLoginPromise = run;
-    return run;
+    return login(undefined);
   },
-  async cancelLogin() {
-    return account.cancelLogin();
+  cancelLogin() {
+    return cancelLogin(undefined);
+  },
+  async accountLogin(params) {
+    if (!validHarness(params) || !linuxAccountsSupported()) return { ok: false, error: 'unsupported' };
+    const { accountDir, methodId, secret } = params ?? {};
+    if (methodId !== 'linux-keyring') return { ok: false, error: 'unsupported' };
+    if (typeof accountDir !== 'string' || typeof secret !== 'string') return { ok: false, error: 'invalid-secret' };
+    return login(accountDir, secret);
+  },
+  accountLoginCancel(params) {
+    if (validHarness(params)) cancelLogin(params?.accountDir);
+    return { ok: true };
   },
   async logout() {
-    if (customPathPending > 0) return { ok: false, error: 'busy' };
-    usageRead = undefined;
-    return account.logout().finally(() => { accountStatusRead = undefined; });
+    if (customPathPending || activeLogin) return { ok: false, error: 'busy' };
+    usageReads.delete(undefined);
+    return account.logout().finally(() => { accountStatusReads.delete(undefined); });
   },
   async listModels(params) {
     return listModels(params).then((result) => {

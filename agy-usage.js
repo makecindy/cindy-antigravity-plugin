@@ -25,6 +25,17 @@ function windowMinutesOf(period) {
   return minutes >= 1 && minutes <= MAX_WINDOW_MINUTES ? minutes : undefined;
 }
 
+// agy 1.5.x's /usage reports group names but no model IDs. Keep the IDs keyed by the
+// original CLI labels so Cindy can distinguish the general Gemini pool from the Argon pool.
+const POOL_MODELS = new Map([
+  ['Gemini Models', [
+    'gemini-4-hydrogen', 'gemini-4-carbon', 'gemini-4-neon', 'gemini-3.8-flash',
+    'gemini-3-8-flash', 'gemini-pro-orchestrator-neon',
+  ]],
+  ['Gemini 4 Argon', ['gemini-4-argon', 'gemini-pro-orchestrator-g1-pro']],
+  ['Claude and GPT models', ['claude-opus-5-5', 'claude-sonnet-5-5', 'gpt-oss-120b-medium']],
+]);
+
 /** agy's /usage command is answered by the CLI itself, outside a model turn. */
 function usageFromReport(report) {
   if (report?.status !== 'SUCCESS' || report.command?.name !== 'usage' || report.num_turns !== 0) return null;
@@ -42,9 +53,11 @@ function usageFromReport(report) {
       if (!label || label.length > 120 || /[\x00-\x1f\x7f]/.test(label)) continue;
       const resetsAt = Date.parse(bucket.reset_time);
       const windowMinutes = windowMinutesOf(period);
+      const models = POOL_MODELS.get(group.name);
       windows.push({ label, remainingPercent: Math.round(fraction * 10000) / 100,
         ...(Number.isFinite(resetsAt) && resetsAt > 0 ? { resetsAt } : {}),
-        ...(windowMinutes ? { windowMinutes } : {}) });
+        ...(windowMinutes ? { windowMinutes } : {}),
+        ...(models ? { models } : {}) });
       if (windows.length === 24) break;
     }
     if (windows.length === 24) break;
@@ -53,7 +66,7 @@ function usageFromReport(report) {
 }
 
 async function readUsage(options) {
-  const executable = resolveAgy(options);
+  const executable = options?.agyPath ?? resolveAgy(options);
   if (!executable) return null;
   // The Windows updater can open a terminal of its own even when agy is hidden.
   const env = options?.env ?? process.env;

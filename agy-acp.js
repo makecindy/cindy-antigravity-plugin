@@ -21,8 +21,10 @@
 
 const os = require('node:os');
 const { attachSteering } = require('./agy-steering.js');
+const { accountErrorRelay } = require('./agy-account-errors.js');
 const { ACP_ARGS, detectAgy, readCustomAgyConfig, resolveAgy, spawnAgy, killTree } = require('./resolve-agy.js');
 const remoteWorkspace = require('./remote-workspace.js');
+const { accountDirFromArgv, accountOptions } = require('./agy-linux-accounts.js');
 
 /** agy normally exits right after stdin closes; force it if it lingers. */
 const STDIN_END_GRACE_MS = 5_000;
@@ -57,10 +59,10 @@ function exitCodeFor(code, signal) {
   return 1;
 }
 
-function run(agyPath) {
+function run(agyPath, options) {
   let child;
   try {
-    child = spawnAgy(agyPath, ACP_ARGS, { stdio: ['pipe', 'pipe', 'pipe'] });
+    child = spawnAgy(agyPath, ACP_ARGS, { ...options, stdio: ['pipe', 'pipe', 'pipe'] });
   } catch (error) {
     exitAfterStderr(`[agy-acp] Could not start Antigravity at ${agyPath} (${describe(error)}).`, NOT_FOUND_EXIT_CODE);
     return;
@@ -130,7 +132,10 @@ function run(agyPath) {
     });
   });
 
-  const { detach: detachSteering, relay: stdoutRelay } = attachSteering(process.stdin, process.stdout, child, () => stop('SIGTERM'));
+  const { detach: detachSteering, relay: stdoutRelay } = attachSteering(
+    process.stdin, process.stdout, child, () => stop('SIGTERM'),
+    process.platform === 'linux' ? accountErrorRelay() : null,
+  );
   child.stdin.on('error', () => {
     // EPIPE after agy exited; the exit handler takes care of shutting down.
   });
@@ -183,7 +188,7 @@ function missingAgyMessage() {
  * The project is on another computer: only an agy that is known to honour the restricted agent
  * may run the task. Any doubt ends here, before agy sees a single message.
  */
-async function runRemoteWorkspace() {
+async function runRemoteWorkspace(options) {
   const found = await detectAgy();
   if (!found.path) {
     exitAfterStderr(missingAgyMessage(), NOT_FOUND_EXIT_CODE);
@@ -203,7 +208,8 @@ async function runRemoteWorkspace() {
   remoteWorkspace.startRemoteWorkspace(found.path, {
     acpArgs: ACP_ARGS,
     guest: remoteWorkspace.isGuestWorkspaceLaunch(process.argv),
-    spawnAgy,
+    accountErrors: process.platform === 'linux' ? accountErrorRelay() : null,
+    spawnAgy: (binary, args, settings) => spawnAgy(binary, args, { ...options, ...settings }),
     killTree,
     exitAfterStderr,
     describe,
@@ -213,10 +219,12 @@ async function runRemoteWorkspace() {
   });
 }
 
-if (remoteWorkspace.isRemoteWorkspaceLaunch(process.argv)) {
-  runRemoteWorkspace();
-} else {
-  const agyPath = resolveAgy();
-  if (agyPath) run(agyPath);
+async function start() {
+  const options = await accountOptions(accountDirFromArgv(process.argv));
+  if (remoteWorkspace.isRemoteWorkspaceLaunch(process.argv)) return runRemoteWorkspace(options);
+  const agyPath = options?.agyPath ?? resolveAgy();
+  if (agyPath) run(agyPath, options);
   else exitAfterStderr(missingAgyMessage(), NOT_FOUND_EXIT_CODE);
 }
+
+start().catch(error => exitAfterStderr(`[agy-acp] ${describe(error)}`, 1));

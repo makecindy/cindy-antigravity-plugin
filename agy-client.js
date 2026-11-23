@@ -89,7 +89,7 @@ function connect(child) {
  * { child, call, init, close }. Always call close() (it ends stdin, then force-stops a lingering agy).
  */
 async function openAgy(options) {
-  const agyPath = resolveAgy(options);
+  const agyPath = options?.agyPath ?? resolveAgy(options);
   if (!agyPath) return null;
   const child = spawnAgy(agyPath, ACP_ARGS, options);
   if (options && typeof options.onSpawn === 'function') options.onSpawn(child);

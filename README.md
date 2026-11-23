@@ -108,13 +108,23 @@ agy --settings {"useG1Credits":false} acp --disable-telemetry
 - **退出登录**：先在页面上确认，再发 `logout`。agy 的 `logout` 不校验参数、一调用就登出，所以插件只在确认后发送。
   退出后 Cindy 里的 Antigravity 和终端里的 agy 都需要重新登录。
 
-登录信息由 agy 保存在它自己的存储里（Windows 上是系统凭据管理器），插件与 Cindy 都不保存。
+默认登录由 agy 保存在系统凭据存储里。支持引擎账号的 Cindy 会显示当前登录的状态与订阅档位
+（`accountStatus` 复用模型探测会话），其中没有邮箱。在 Linux 上，如果桌面宿主给插件进程的 D-Bus 地址为空或为 `disabled:`，
+插件会在确认同 UID 的标准 Unix socket 存在后，用该地址启动 agy。已经可用或显式设置的地址保持原样。
 
-支持引擎账号的 Cindy 会在 Antigravity 引擎下显示当前登录的订阅档位（例如 Google AI Ultra）。插件只上报
-这一个登录（`accountStatus`：是否已登录与订阅档位，读法同上面的「状态」，复用模型探测会话，不新建会话），同样不含
-邮箱。**不支持在 Cindy 里添加多个 Antigravity 账号**：agy 把 Google 登录存在系统凭据存储的固定位置，一台电脑只有
-一个登录，换 HOME 等目录也还是同一个账号（agy 1.5.14 实测），agy 本身也不支持多个 Google 账号。要换账号，请在
-设置页退出后用另一个 Google 账号登录。
+### Linux 复用已有的独立账号
+
+包含 Cindy 插件引擎多账号支持的宿主，可在模型供应商设置里选「复用已有 Linux 钥匙串」新增账号。
+输入已备份的独立账号目录的绝对路径。这个目录须属于当前用户，仅当前用户可访问，包含 `unlock` 以及 `data/keyrings/` 中原生
+GNOME Keyring 保存的文件。此方式适用于已有独立 Secret Service 的账号备份。插件通过本机受保护输入接收路径，
+把原生钥匙串文件复制到宿主分配的空账号目录，由该账号独立的 Secret Service 解锁，并通过 agy 查询登录状态。
+原始备份、默认账号和系统钥匙串保持原样，插件不会解析或输出 Google 令牌。新账号需要先在独立钥匙串环境里完成 Google 授权，
+本方法用于复用已有登录。
+
+需要 Linux 的 Python 3、D-Bus、GNOME Keyring 和 gdbus。每个账号按需启动独立钥匙串服务，任务、用量和登录状态使用同一隔离目录。
+会话历史也按账号存放。换号时 Cindy 保留同一任务并移交上下文，新账号使用自己的原生会话。
+Linux 外的环境和旧版 Cindy 保留原来的单账号流程。agy 的 ACP 登录检查未提供稳定身份标识，请分别导入不同 Google 账号的备份。
+导入只用于添加空账号。现有账号的钥匙串不会被覆盖。
 
 | 文件 | 作用 |
 | --- | --- |
@@ -125,6 +135,7 @@ agy --settings {"useG1Credits":false} acp --disable-telemetry
 | `agy-client.js` | 插件自用的短时 ACP 连接（启动 agy、`initialize`、调用、停止） |
 | `agy-models.js` | 经 ACP 读取模型、每个模型的思考深度、agy 的工作模式与订阅档位 |
 | `agy-account.js` | 经 ACP 查询登录状态、用 Google 登录、取消登录、退出登录 |
+| `agy-linux-accounts.js` / `agy-linux-keyring.py` | 校验宿主账号目录、复用已有 Linux 钥匙串和按账号启动 Secret Service |
 | `agy-acp.js` | ACP 引擎入口：启动 `agy acp`，双向转发 ACP，支持插话时转换请求 |
 | `remote-workspace.js` | 任务文件在另一台电脑时：受限 Agent 的定义、两段式启动，以及读懂 ACP 的转接 |
 | `settings.html` / `settings.js` | 设置页：检测结果、版本、位置、自定义路径、安装提示、账号（登录 / 退出）与「重新检测」 |
