@@ -25,7 +25,8 @@
  *
  * Sign-in stays with agy (Google account in agy's own store, see agy-account.js); the plugin never
  * sees credentials or the email, only whether agy is signed in and its subscription tier name.
- * While agy is not signed in the engine is published as unavailable with a sign-in hint.
+ * A signed-out default login gets a sign-in hint. On Linux the engine stays registered so Cindy
+ * can use an imported account or expose the import method.
  */
 (function () {
   'use strict';
@@ -120,6 +121,7 @@
   var modelSessionId = null;
   var modelsListedAt = 0;
   var modelsInflight = null;
+  var importedCatalog = null;
 
   /**
    * agy's sign-in as last seen (by a listing, a status check, a sign-in or a sign-out); kept in
@@ -221,7 +223,10 @@
 
   /** Only metadata leaves the plugin: never the executable path or a command. */
   function harnessEntry(result) {
-    var entry = { id: HARNESS_ID, available: result.available === true && !signInRequired };
+    var entry = {
+      id: HARNESS_ID,
+      available: result.available === true && (!signInRequired || result.linuxAccounts),
+    };
     if (entry.available) {
       entry.reportsUsage = true;
       entry.accounts = { methods: result.linuxAccounts ? [{
@@ -235,7 +240,7 @@
       entry.guestWorkspace = true;
     }
 
-    if (result.available === true && signInRequired) {
+    if (!entry.available && result.available === true && signInRequired) {
       entry.reason = 'not-signed-in';
       entry.message = SIGN_IN_MESSAGES[locale] || SIGN_IN_MESSAGES.en;
     } else if (!entry.available) {
@@ -246,10 +251,14 @@
     }
     var version = shortString(result.version, 64);
     if (version) entry.version = version;
-    if (entry.available && models && models.length) entry.models = models;
-    if (entry.available && modes && modes.length) {
-      entry.modes = modes;
-      if (defaultMode) entry.defaultMode = defaultMode;
+    var fallback = result.linuxAccounts && (signInRequired || !models?.length) ? importedCatalog : null;
+    var shownModels = fallback?.models ?? models;
+    var shownModes = fallback?.modes ?? modes;
+    var shownDefaultMode = fallback ? fallback.defaultMode : defaultMode;
+    if (entry.available && shownModels?.length) entry.models = shownModels;
+    if (entry.available && shownModes?.length) {
+      entry.modes = shownModes;
+      if (shownDefaultMode) entry.defaultMode = shownDefaultMode;
     }
     return entry;
   }
@@ -424,6 +433,7 @@
         accountOp = null;
         accountOpToken = null;
         models = null;
+        importedCatalog = null;
         modes = null;
         defaultMode = null;
         modelsListedAt = 0;
@@ -849,7 +859,28 @@
     };
   }
 
+  function handleImportedCatalog(message) {
+    if (message?.type !== 'event' || message.name !== 'node-notification' ||
+        message.method !== 'imported-account-catalog') return false;
+    if (customPathPending || (lastResult && !lastResult.linuxAccounts)) return true;
+    var next = sanitizeModels(message.params?.models);
+    if (!next.length) return true;
+    var nextModes = sanitizeModes(message.params?.modes || []);
+    var nextDefault = nextModes.includes(message.params?.defaultMode) ? message.params.defaultMode : null;
+    var catalog = { models: next, modes: nextModes, defaultMode: nextDefault };
+    if (JSON.stringify(importedCatalog) === JSON.stringify(catalog)) return true;
+    importedCatalog = catalog;
+    if (lastResult?.available && (signInRequired || !models?.length)) {
+      var gen = pathGeneration;
+      publish(lastResult).then(function (published) {
+        if (gen === pathGeneration) lastPublish = published;
+      });
+    }
+    return true;
+  }
+
   cindy.onHostMessage(function (message) {
+    if (handleImportedCatalog(message)) return;
     if (handleCliProgress(message)) return;
     // Cindy opened a model picker (its provider-style refresh, with its own cooldown).
     if (message && message.type === 'harnesses-refresh-requested') {

@@ -957,6 +957,61 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
       message: 'Antigravity 还没有登录。请打开 Antigravity 插件设置，点「用 Google 登录」。' });
   });
 
+  test('Linux keeps imported accounts and discovers their models when the default login signs out', async () => {
+    const puts = [];
+    let hostMessage;
+    let postToSettings;
+    let channel;
+    const detection = { available: true, version: '1.5.15', linuxAccounts: true };
+    const ctx = vm.createContext({
+      BroadcastChannel: class {
+        constructor() { channel = this; }
+        postMessage(message) { postToSettings?.(message); }
+      },
+      setTimeout,
+      clearTimeout,
+      cindy: {
+        request: async () => ({ ok: true, context: { locale: 'en' } }),
+        node: {
+          request: async ({ method }) => ({
+            ok: true,
+            result: {
+              detect: detection,
+              listModels: { supported: true, models: [{ id: 'default-model', name: 'Default account model' }] },
+              logout: { ok: true },
+            }[method],
+          }),
+        },
+        onHostMessage: (handler) => { hostMessage = handler; },
+      },
+      fetch: async (url, init) => {
+        if (url === '/kv' && !init) return { ok: true, json: async () => ({}) };
+        if (url === '/harnesses') puts.push(JSON.parse(init.body).harnesses[0]);
+        return { ok: true, status: 204 };
+      },
+    });
+    vm.runInContext(fs.readFileSync(path.join(root, 'main.js'), 'utf8'), ctx, { filename: 'main.js' });
+    await waitFor(() => puts.at(-1)?.models?.[0]?.id === 'default-model', 3_000, 'default model list');
+    hostMessage({
+      type: 'event', name: 'node-notification', method: 'imported-account-catalog',
+      params: { models: [{ id: 'imported-model', name: 'Imported account model', efforts: ['low', 'high'] }],
+        modes: ['default', 'plan'], defaultMode: 'plan' },
+    });
+    assert.equal(puts.at(-1).models[0].id, 'default-model');
+    let logoutResult;
+    postToSettings = (message) => {
+      if (message.type === 'account-result' && message.reqId === 'signed-out') logoutResult = message;
+    };
+    channel.onmessage({ data: { type: 'account-request', reqId: 'signed-out', op: 'logout' } });
+    await waitFor(() => logoutResult, 3_000, 'default sign out');
+    assert.equal(logoutResult.account.signedIn, false);
+    assert.equal(puts.at(-1).available, true);
+    assert.equal(puts.at(-1).accounts.methods[0].id, 'linux-keyring');
+    assert.equal(puts.at(-1).reason, undefined);
+    assert.deepEqual(puts.at(-1).models, [{ id: 'imported-model', name: 'Imported account model', efforts: ['low', 'high'] }]);
+    assert.equal(puts.at(-1).defaultMode, 'plan');
+  });
+
   // agy 的 logout 一调用就登出(2026-11-19 实测)：设置页只在用户确认后才发出退出请求。
   test('the settings page resumes a CLI update after reopening and confirms sign-out', async () => {
     class Channel {
@@ -1180,6 +1235,7 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
     const afterFailedSave = await worker.call({ jsonrpc: '2.0', id: 6, method: 'detect', params: { locale: 'en' } });
     assert.equal(afterFailedSave.result.customPath, undefined);
     assert.equal(afterFailedSave.result.version, '0.2.2');
+    assert.equal(typeof afterFailedSave.result.linuxAccounts, 'boolean');
 
     // Saving a quoted custom path succeeds and routes detect, account, login, listModels, usage, and agy-acp to it.
     const saved = await worker.call({ jsonrpc: '2.0', id: 7, method: 'setCustomPath', params: { path: `"${customBin}"`, locale: 'en' } });
@@ -1188,6 +1244,7 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
     assert.equal(saved.result.detection.available, true);
     assert.equal(saved.result.detection.version, '9.9.9');
     assert.equal(saved.result.detection.customPathConfigured, true);
+    assert.equal(saved.result.detection.linuxAccounts, afterFailedSave.result.linuxAccounts);
     assert.ok(samePath(saved.result.detection.path, customBin));
     assert.ok(samePath(saved.result.detection.customPath, customBin));
 
@@ -1256,6 +1313,7 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
     assert.equal(cleared.result.customPath, null);
     assert.equal(cleared.result.detection.available, true);
     assert.equal(cleared.result.detection.version, '0.2.2');
+    assert.equal(cleared.result.detection.linuxAccounts, afterFailedSave.result.linuxAccounts);
     assert.equal(cleared.result.detection.customPath, undefined);
     assert.ok(samePath(cleared.result.detection.path, fixture.agyPath));
     await worker.close();

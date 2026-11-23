@@ -53,6 +53,7 @@ const { accountOptions, importAccount, linuxAccountsSupported } = require('./agy
 const HARNESS_ID = 'agy';
 /** Cindy waits 26 s for accountStatus; answer "unknown" before that rather than not at all. */
 const ACCOUNT_STATUS_DEADLINE_MS = 20_000;
+const IMPORTED_CATALOG_DEADLINE_MS = 15_000;
 
 function reply(message) {
   process.stdout.write(JSON.stringify(message) + '\n');
@@ -77,6 +78,41 @@ let maintenanceActive = false;
 let customPathPending = 0;
 let customPathQueue = Promise.resolve();
 let activeLogin = null;
+let catalogGeneration = 0;
+
+async function detect(params) {
+  const locale = typeof params?.locale === 'string' ? params.locale : undefined;
+  return { ...await detectAgy({ locale }), linuxAccounts: linuxAccountsSupported() };
+}
+
+/**
+ * Called with a host-selected account directory only. An account discovers and remembers its own
+ * model-list session. In addition to the host's per-account filter, send usable picker metadata
+ * to the resident page, without identifying the account or its credential directory.
+ */
+async function importedAccountStatus(options, generation) {
+  const status = await account.accountStatus({}, options);
+  if (status?.state !== 'signed-in') return status;
+  const previous = readModelSession(options);
+  const listing = await withDeadline(listModels(previous ? { sessionId: previous } : {}, options)
+    .catch(() => null), IMPORTED_CATALOG_DEADLINE_MS, null);
+  if (listing?.supported === false && listing.reason === 'not-signed-in') return { state: 'signed-out' };
+  if (!listing?.supported || !Array.isArray(listing.models)) {
+    // Catalog data can fail independently of the login. Keep a valid login usable.
+    return status;
+  }
+  if (generation !== catalogGeneration || customPathPending) return null;
+  if (listing.sessionId) rememberModelSession(listing.sessionId, options);
+  const { models, modes, defaultMode } = listing;
+  if (models.length) reply({ jsonrpc: '2.0', method: 'imported-account-catalog', params: { models, modes, defaultMode } });
+  const name = listing.tier?.name;
+  const plan = typeof name === 'string' && !/[\u0000-\u001f\u007f-\u009f]/.test(name) ? name.slice(0, 64).trim() : '';
+  return {
+    state: 'signed-in',
+    ...(plan ? { plan } : {}),
+    ...(models.length ? { models: models.map(model => model.id) } : {}),
+  };
+}
 
 function readOnce(reads, dir, read) {
   if (!reads.has(dir)) {
@@ -129,7 +165,6 @@ function cancelLogin(dir) {
 
 async function applyCustomPath(params) {
   if (maintenanceActive) return { ok: false, error: 'busy' };
-  const locale = typeof params.locale === 'string' ? params.locale : undefined;
   const checked = validateCustomPath(params.path);
   if (!checked.ok) return { ok: false, error: checked.error };
   if (checked.path !== null) {
@@ -141,6 +176,7 @@ async function applyCustomPath(params) {
   if (!saved.ok) return { ok: false, error: saved.error };
   usageReads.clear();
   accountStatusReads.clear();
+  catalogGeneration++;
   // Like main.js, start the model listing of the new executable afresh.
   rememberModelSession(null);
   const pendingLogin = activeLogin;
@@ -148,7 +184,7 @@ async function applyCustomPath(params) {
     cancelLogin(pendingLogin.dir);
     await pendingLogin.run;
   }
-  const detection = await detectAgy({ locale });
+  const detection = await detect(params);
   return { ok: true, customPath: saved.customPath, detection };
 }
 
@@ -171,10 +207,7 @@ const handlers = {
     const dir = params?.accountDir;
     return readOnce(usageReads, dir, async () => require('./agy-usage.js').readUsage(await accountOptions(dir)));
   },
-  async detect(params) {
-    const locale = params && typeof params.locale === 'string' ? params.locale : undefined;
-    return { ...await detectAgy({ locale }), linuxAccounts: linuxAccountsSupported() };
-  },
+  detect,
   setCustomPath(params) {
     if (!params || typeof params.path !== 'string') return { ok: false, error: 'not-absolute' };
     customPathPending += 1;
@@ -192,10 +225,12 @@ const handlers = {
   accountStatus(params) {
     if (!validHarness(params)) return null;
     const dir = params?.accountDir;
+    const generation = catalogGeneration;
     const pending = readOnce(accountStatusReads, dir, async () => {
       const options = await accountOptions(dir);
-      const sessionId = dir === undefined ? readModelSession() : null;
-      return account.accountStatus(sessionId ? { sessionId } : {}, options);
+      if (options) return importedAccountStatus(options, generation);
+      const sessionId = readModelSession();
+      return account.accountStatus(sessionId ? { sessionId } : {});
     });
     return withDeadline(pending, ACCOUNT_STATUS_DEADLINE_MS, null);
   },
