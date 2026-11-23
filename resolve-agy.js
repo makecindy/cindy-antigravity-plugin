@@ -414,7 +414,33 @@ function childEnv(agyPath, options) {
     parts.push(...fallbacks.filter(isDirectory));
   }
   out.PATH = uniqueAbsolute(ctx, parts).join(ctx.win ? ';' : ':');
+  if (ctx.platform === 'linux') restoreLinuxSessionBus(out);
   return out;
+}
+
+/**
+ * Older Cindy utility processes can pass Chromium's disabled: placeholder
+ * after filtering the parent environment. Give agy the current user's
+ * standard session socket when it is available. Explicit session addresses
+ * and nonstandard runtime directories can belong to isolated environments.
+ */
+function restoreLinuxSessionBus(env) {
+  const address = env.DBUS_SESSION_BUS_ADDRESS;
+  if (address && address !== 'disabled:') return;
+  if (typeof process.getuid !== 'function') return;
+  const uid = process.getuid();
+  const runtime = '/run/user/' + uid;
+  if (env.XDG_RUNTIME_DIR && env.XDG_RUNTIME_DIR !== runtime) return;
+  const socket = runtime + '/bus';
+  try {
+    const stat = fs.lstatSync(socket);
+    if (!stat.isSocket() || stat.uid !== uid) return;
+  } catch {
+    // An absent or inaccessible socket can be deliberate. Keep the supplied environment.
+    return;
+  }
+  env.DBUS_SESSION_BUS_ADDRESS = 'unix:path=' + socket;
+  if (!env.XDG_RUNTIME_DIR) env.XDG_RUNTIME_DIR = runtime;
 }
 
 function windowsSystemExe(env, name) {
