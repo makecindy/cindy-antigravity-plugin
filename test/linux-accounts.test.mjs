@@ -98,6 +98,11 @@ test('only explicit quota or authentication errors reach the host account router
   assert.equal(response(3, { code: -32000, message: 'auth_required' }).data._meta.cindy.kind, 'auth-required');
   assert.equal(response(4, quota), quota);
   assert.equal(response(5, rateLimited), rateLimited);
+  const structuredCapacity = {
+    ...capacity, message: 'HTTP 503: model quota exhausted', data: { reason: 'MODEL_CAPACITY_EXHAUSTED' },
+  };
+  relay.request({ id: 6, method: 'session/prompt' });
+  assert.equal(response(6, structuredCapacity), structuredCapacity);
 });
 
 test('the CLI Argon quota is scoped to Argon rather than the general Gemini pool', async () => {

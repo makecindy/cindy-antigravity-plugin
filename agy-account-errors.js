@@ -3,6 +3,7 @@
 const { isObject, isSessionOpen } = require('./agy-mcp.js');
 
 const QUOTA_REASONS = new Set(['QUOTA_EXHAUSTED', 'SUBSCRIPTION_QUOTA_EXHAUSTED', 'MODEL_QUOTA_EXHAUSTED']);
+const TRANSIENT_REASONS = new Set(['RATE_LIMITED', 'RATE_LIMIT_EXCEEDED', 'MODEL_CAPACITY_EXHAUSTED', 'CAPACITY_EXHAUSTED', 'UNAVAILABLE']);
 const QUOTA_TEXT = /\b(?:subscription|model) quota (?:exhausted|exceeded)\b|\bexceeded (?:the |your )?(?:subscription|model) quota\b/i;
 
 /**
@@ -19,9 +20,11 @@ function classifyResponse(message) {
   let info;
   if (error.code === -32000 || data.reason === 'AUTH_REQUIRED') {
     info = { kind: 'auth-required' };
-  } else if (QUOTA_REASONS.has(data.reason) || QUOTA_REASONS.has(data.status) || QUOTA_TEXT.test(error.message ?? '')) {
+  } else if (QUOTA_REASONS.has(data.reason) || QUOTA_REASONS.has(data.status) ||
+      (!TRANSIENT_REASONS.has(data.reason) && !TRANSIENT_REASONS.has(data.status) &&
+        QUOTA_TEXT.test(error.message ?? ''))) {
     info = { kind: 'usage-limit' };
-    const reset = Number.isFinite(data.resetsAt) && data.resetsAt > Date.now() ? data.resetsAt : undefined;
+    const reset = Number.isSafeInteger(data.resetsAt) && data.resetsAt > Date.now() ? data.resetsAt : undefined;
     if (reset) info.resetsAt = reset;
   }
   if (!info) return message;

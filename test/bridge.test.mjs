@@ -86,6 +86,14 @@ if (JSON.stringify(args) === REMOTE_ARGS) {
         record({ method: message.method, session: message.params });
         if (message.method === 'session/resume') call = DIRECT_CALL;
         send({ id: message.id, result: { sessionId: 'sess-1', configOptions: [] } });
+      } else if (message.method === 'session/prompt' && process.env.FAKE_AGY_SCRIPT === 'limits') {
+        const scenario = message.params.prompt[0].text;
+        const errors = {
+          quota: { code: -32603, message: 'Provider request failed', data: { reason: 'MODEL_QUOTA_EXHAUSTED' } },
+          rate: { code: -32603, message: 'HTTP 429: too many requests' },
+          capacity: { code: -32603, message: 'HTTP 503: unavailable', data: { reason: 'MODEL_CAPACITY_EXHAUSTED' } },
+        };
+        send({ id: message.id, error: errors[scenario] });
       } else if (message.method === 'session/prompt' && process.env.FAKE_AGY_SCRIPT === 'native') {
         // An agy that ignored the agent's tool list: one of its own tools runs, and the turn stays open.
         send({ method: 'session/update', params: { sessionId: 'sess-1', update: { sessionUpdate: 'tool_call', toolCallId: 'call-n',
@@ -457,6 +465,28 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
       [['tool_call', 'Bash', 'execute'], ['tool_call_update', 'Bash', 'execute']]);
     bridge.child.stdin.end();
     assert.equal((await bridge.closed).code, 0);
+  });
+
+  test('remote workspace forwards explicit quota to Cindy without retrying the prompt', {
+    skip: process.platform !== 'linux',
+  }, async (t) => {
+    const { bridge, messages, send, reply, server } = remoteSession(t, { FAKE_AGY_SCRIPT: 'limits' });
+    bridge.child.stdin.write(INITIALIZE);
+    await reply(0, 'initialize answer');
+    send({ jsonrpc: '2.0', id: 1, method: 'session/new',
+      params: { cwd: '/shadow/p', mcpServers: [server('cindy_exec')] } });
+    await reply(1, 'session/new answer');
+
+    for (const [index, scenario] of ['quota', 'rate', 'capacity'].entries()) {
+      const id = index + 2;
+      send({ jsonrpc: '2.0', id, method: 'session/prompt',
+        params: { sessionId: 'sess-1', prompt: [{ type: 'text', text: scenario }] } });
+      const { error } = await reply(id, scenario);
+      assert.equal(error.data?._meta?.cindy?.kind, scenario === 'quota' ? 'usage-limit' : undefined);
+    }
+    bridge.child.stdin.end();
+    assert.equal((await bridge.closed).code, 0);
+    assert.deepEqual(messages().map(message => message.id), [0, 1, 2, 3, 4]);
   });
 
   test('remote-workspace mode does not start a session without Cindy’s file and command tools', async (t) => {
