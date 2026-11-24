@@ -32,6 +32,29 @@ function mcpArguments(input) {
   return {};
 }
 
+/** Keys sorted at every level, so the same arguments always give the same text. */
+function canonicalJson(value) {
+  if (Array.isArray(value)) return '[' + value.map(canonicalJson).join(',') + ']';
+  if (isObject(value)) {
+    return '{' + Object.keys(value).sort().map((key) => JSON.stringify(key) + ':' + canonicalJson(value[key])).join(',') + '}';
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+const FACADE_CALL_KEYS = new Set(['name', 'args', 'toolSummary']);
+
+/**
+ * The real tool behind a gateway `call_tool` input ({ name, args }). agy adds `toolSummary` to what
+ * it reports, not to what it sends. Anything else makes the call invalid, so the approval shown in
+ * Cindy and the call that runs are always read from the same two fields.
+ */
+function facadeCall(input) {
+  if (!isObject(input) || Object.keys(input).some((key) => !FACADE_CALL_KEYS.has(key))) return null;
+  if (typeof input.name !== 'string' || !input.name) return null;
+  if (input.args !== undefined && input.args !== null && !isObject(input.args)) return null;
+  return { tool: input.name, args: isObject(input.args) ? input.args : {} };
+}
+
 /** Use the longest matching server name because server names can themselves contain underscores. */
 function directMcpTool(name, serverNames) {
   if (typeof name !== 'string' || !name.startsWith('mcp_')) return null;
@@ -46,7 +69,11 @@ function directMcpTool(name, serverNames) {
 }
 
 /** Normalize agy's direct and nested MCP calls. Keep their identity on updates that omit it. */
-function normalizeMcpToolCall(toolCall, seen, serverNames, { allowLegacyEnvelope = false, toolIdentity } = {}) {
+/**
+ * `isFacade(server)` (local sessions only) says a server is reached through the gateway; its
+ * `call_tool` then takes the identity and arguments of the real tool it runs.
+ */
+function normalizeMcpToolCall(toolCall, seen, serverNames, { allowLegacyEnvelope = false, toolIdentity, isFacade } = {}) {
   if (!isObject(toolCall)) return null;
   const id = typeof toolCall.toolCallId === 'string' ? toolCall.toolCallId : null;
   const input = toolCall.rawInput;
@@ -57,7 +84,10 @@ function normalizeMcpToolCall(toolCall, seen, serverNames, { allowLegacyEnvelope
     ? { server: input.ServerName, tool: input.ToolName }
     : null;
   const direct = nested ? null : directMcpTool(name, serverNames);
-  const call = nested || direct;
+  const viaFacade = !!direct && direct.tool === 'call_tool' && !!isFacade?.(direct.server);
+  const facade = viaFacade ? facadeCall(input) : null;
+  // An update without arguments keeps the identity its call already has.
+  const call = nested || (facade ? { server: direct.server, tool: facade.tool } : viaFacade && known ? null : direct);
   if (call) {
     const identity = toolIdentity?.(call) ?? { title: `mcp__${call.server}__${call.tool}`, kind: 'other' };
     known = { ...identity, sourceName: name };
@@ -73,6 +103,7 @@ function normalizeMcpToolCall(toolCall, seen, serverNames, { allowLegacyEnvelope
   if ('name' in next) next.name = known.title;
   if ('kind' in next) next.kind = known.kind;
   if (nested) next.rawInput = mcpArguments(input);
+  else if (facade) next.rawInput = facade.args;
   else if (direct && isObject(input)) {
     // agy adds a one-line summary to direct calls. Cindy uses the actual tool arguments.
     const { toolSummary: _summary, ...rest } = input;
@@ -82,4 +113,16 @@ function normalizeMcpToolCall(toolCall, seen, serverNames, { allowLegacyEnvelope
   return next;
 }
 
-module.exports = { completeInitializeResult, isObject, isSessionOpen, normalizeMcpToolCall };
+/**
+ * A `call_tool` of a gateway server: its server and, when the input is valid, the real tool and
+ * arguments (`call`). Null for any other tool.
+ */
+function facadeToolCall(name, rawInput, serverNames, isFacade) {
+  const direct = directMcpTool(name, serverNames);
+  if (!direct || direct.tool !== 'call_tool' || !isFacade(direct.server)) return null;
+  return { server: direct.server, call: facadeCall(rawInput) };
+}
+
+module.exports = {
+  canonicalJson, completeInitializeResult, facadeCall, facadeToolCall, isObject, isSessionOpen, normalizeMcpToolCall,
+};
