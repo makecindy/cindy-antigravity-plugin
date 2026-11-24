@@ -58,7 +58,12 @@ async function fakeServer(t, state = {}) {
       const response = { jsonrpc: '2.0', id: message.id, result };
       const reply = JSON.stringify(message.method === 'tools/call' && state.callNotification
         ? [response, state.callNotification] : response);
-      if (state.multiline) {
+      if (state.keepListStream && message.method === 'tools/list') {
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.write('data: {"jsonrpc":"2.0","id":"unrelated","result":{"tools":[]}}\n\n');
+        res.write(`event: message\ndata: {"jsonrpc":"2.0",\ndata: "id":${JSON.stringify(message.id)},"result":${JSON.stringify(result)}}\n\n`);
+        state.streams.push(res);
+      } else if (state.multiline) {
         // One message over several data lines, as SSE allows; `multiline` is the line ending.
         const eol = state.multiline;
         const lines = JSON.stringify(JSON.parse(reply), null, 1).split('\n');
@@ -363,6 +368,39 @@ describe('MCP gateway relay', () => {
     assert.equal(text(reply), 'ran get_me');
   });
 
+  test('an open SSE stream delivers the tool list and allows a directory refresh', { timeout: 5_000 }, async (t) => {
+    const github = await fakeServer(t, { keepListStream: true });
+    const { servers } = await relayFor(t, [httpServer('custom_github', github.url)]);
+    const url = servers[0].url;
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'mcp-session-id': 'S1' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 'l', method: 'tools/list' }),
+      signal: AbortSignal.timeout(3_000),
+    });
+    const reader = response.body.getReader();
+    t.after(() => reader.cancel().catch(() => {}));
+    const decoder = new TextDecoder();
+    let data = '';
+    while (!data.includes('\n\n', data.indexOf('\n\n') + 2) || !data.includes('"id":"l"')) {
+      const { value, done } = await reader.read();
+      assert.equal(done, false, 'the list should arrive before the stream ends');
+      data += decoder.decode(value, { stream: true });
+    }
+    const messages = data.split('\n\n').filter(Boolean)
+      .map((event) => JSON.parse(event.split('\n').find((line) => line.startsWith('data: ')).slice(6)));
+    assert.deepEqual(messages[0], { jsonrpc: '2.0', id: 'unrelated', result: { tools: [] } });
+    assert.deepEqual(messages[1].result.tools.map((tool) => tool.name), ['list_tools', 'call_tool']);
+    assert.equal(github.state.streams[0].writableEnded, false);
+
+    github.state.tools = [...GITHUB_TOOLS, { name: 'new_tool', inputSchema: { type: 'object' } }];
+    const refreshed = await mcp(url, { id: 'refresh', method: 'tools/call', params: {
+      name: 'list_tools', arguments: { name: 'new_tool' },
+    } }, { 'mcp-session-id': 'S2' });
+    assert.equal(JSON.parse(text(refreshed)).name, 'new_tool');
+    assert.equal(github.state.streams[1].writableEnded, false);
+  });
+
   test('each MCP session on one relay route keeps its own tool list', async (t) => {
     const github = await fakeServer(t);
     const { relay, servers, targets } = await relayFor(t, [httpServer('custom_github', github.url)]);
@@ -513,11 +551,11 @@ async function gatewaySession(t, { method = 'session/new', sessionId = 'one' } =
   h.agy({ id: 1, result: method === 'session/new' ? { sessionId } : {} });
   await listTools(sent[0].url); // agy reads the tool list when it connects
   let nextId = 0;
-  const ask = (rawInput, toolCallId = `tc${++nextId}`) => {
+  const ask = (rawInput, toolCallId = `tc${++nextId}`, name = 'mcp_custom_github_call_tool') => {
     const id = `perm-${toolCallId}`;
     h.agy({ id, method: 'session/request_permission', params: {
       sessionId, options: OPTIONS,
-      toolCall: { toolCallId, name: 'mcp_custom_github_call_tool', title: 'Run', kind: 'other', rawInput: { ...rawInput, toolSummary: 'Comment' } },
+      toolCall: { toolCallId, name, title: 'Run', kind: 'other', rawInput: { ...rawInput, toolSummary: 'Comment' } },
     } });
     return { id, toolCallId };
   };
@@ -542,6 +580,27 @@ describe('gateway approvals in ACP', () => {
     assert.equal(text(await callTool(s.url, 'call_tool', { name: 'add_issue_comment', args })), 'ran add_issue_comment');
     assert.equal((await callTool(s.url, 'call_tool', { name: 'add_issue_comment', args })).message.result.isError, true);
     assert.equal(s.github.state.calls.length, 1);
+  });
+
+  test('a nested call_mcp_tool uses the same exact, single-use approval as a direct call', async (t) => {
+    const s = await gatewaySession(t);
+    const inner = { name: 'search_repositories', args: { query: 'repo:test' } };
+    for (const Arguments of [inner, JSON.stringify(inner)]) {
+      const { id } = s.ask({
+        ServerName: 'custom_github', ToolName: 'call_tool', Arguments,
+      }, undefined, 'call_mcp_tool');
+      const { toolCall, options } = s.toCindy.find((m) => m.id === id).params;
+      assert.equal(toolCall.title, 'mcp__custom_github__search_repositories');
+      assert.equal(toolCall.name, toolCall.title);
+      assert.deepEqual(toolCall.rawInput, inner.args);
+      assert.deepEqual(options.map((option) => option.kind), ['allow_once', 'reject_once']);
+      s.answer(id, 'yes');
+      await waitUntil(() => s.toAgy.some((m) => m.id === id));
+      assert.equal((await callTool(s.url, 'call_tool', { ...inner, args: { query: 'changed' } })).message.result.isError, true);
+      assert.equal(text(await callTool(s.url, 'call_tool', inner)), 'ran search_repositories');
+      assert.equal((await callTool(s.url, 'call_tool', inner)).message.result.isError, true);
+    }
+    assert.deepEqual(s.github.state.calls.map((call) => call.arguments), [inner.args, inner.args]);
   });
 
   test('a rejection, a changed argument or an option that was not offered never reaches the server', async (t) => {

@@ -68,6 +68,18 @@ function directMcpTool(name, serverNames) {
   return found;
 }
 
+function nestedMcpTool(name, input, serverNames, allowLegacyEnvelope) {
+  return isObject(input) && typeof input.ServerName === 'string' && typeof input.ToolName === 'string'
+    && (allowLegacyEnvelope || (name === 'call_mcp_tool' && serverNames.includes(input.ServerName)))
+    ? { server: input.ServerName, tool: input.ToolName }
+    : null;
+}
+
+function gatewayCall(tool, input, isFacade) {
+  if (tool?.tool !== 'call_tool' || !isFacade?.(tool.server)) return null;
+  return { server: tool.server, call: facadeCall(input) };
+}
+
 /** Normalize agy's direct and nested MCP calls. Keep their identity on updates that omit it. */
 /**
  * `isFacade(server)` (local sessions only) says a server is reached through the gateway; its
@@ -79,15 +91,13 @@ function normalizeMcpToolCall(toolCall, seen, serverNames, { allowLegacyEnvelope
   const input = toolCall.rawInput;
   let known = id ? seen.get(id) : undefined;
   const name = allowLegacyEnvelope ? toolCall.name : toolCall.name ?? known?.sourceName;
-  const nested = isObject(input) && typeof input.ServerName === 'string' && typeof input.ToolName === 'string'
-    && (allowLegacyEnvelope || (name === 'call_mcp_tool' && serverNames.includes(input.ServerName)))
-    ? { server: input.ServerName, tool: input.ToolName }
-    : null;
+  const nested = nestedMcpTool(name, input, serverNames, allowLegacyEnvelope);
   const direct = nested ? null : directMcpTool(name, serverNames);
-  const viaFacade = !!direct && direct.tool === 'call_tool' && !!isFacade?.(direct.server);
-  const facade = viaFacade ? facadeCall(input) : null;
+  const args = nested ? mcpArguments(input) : input;
+  const gateway = gatewayCall(nested ?? direct, args, isFacade);
   // An update without arguments keeps the identity its call already has.
-  const call = nested || (facade ? { server: direct.server, tool: facade.tool } : viaFacade && known ? null : direct);
+  const call = gateway?.call ? { server: gateway.server, tool: gateway.call.tool }
+    : gateway && known ? null : nested ?? direct;
   if (call) {
     const identity = toolIdentity?.(call) ?? { title: `mcp__${call.server}__${call.tool}`, kind: 'other' };
     known = { ...identity, sourceName: name };
@@ -102,8 +112,8 @@ function normalizeMcpToolCall(toolCall, seen, serverNames, { allowLegacyEnvelope
   if ('title' in next) next.title = known.title;
   if ('name' in next) next.name = known.title;
   if ('kind' in next) next.kind = known.kind;
-  if (nested) next.rawInput = mcpArguments(input);
-  else if (facade) next.rawInput = facade.args;
+  if (gateway?.call) next.rawInput = gateway.call.args;
+  else if (nested) next.rawInput = args;
   else if (direct && isObject(input)) {
     // agy adds a one-line summary to direct calls. Cindy uses the actual tool arguments.
     const { toolSummary: _summary, ...rest } = input;
@@ -118,9 +128,8 @@ function normalizeMcpToolCall(toolCall, seen, serverNames, { allowLegacyEnvelope
  * arguments (`call`). Null for any other tool.
  */
 function facadeToolCall(name, rawInput, serverNames, isFacade) {
-  const direct = directMcpTool(name, serverNames);
-  if (!direct || direct.tool !== 'call_tool' || !isFacade(direct.server)) return null;
-  return { server: direct.server, call: facadeCall(rawInput) };
+  const nested = nestedMcpTool(name, rawInput, serverNames);
+  return gatewayCall(nested ?? directMcpTool(name, serverNames), nested ? mcpArguments(rawInput) : rawInput, isFacade);
 }
 
 module.exports = {

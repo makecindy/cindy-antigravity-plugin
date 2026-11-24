@@ -90,45 +90,16 @@ function eventData(event) {
   return lines.length ? lines.map((line) => line.slice(5).replace(/^ /, '')).join('\n') : null;
 }
 
-/** A whole SSE body as [event, separator] pairs; a trailing partial event has an empty separator. */
-function splitEvents(body) {
-  const events = [];
-  let start = 0;
-  for (const end of body.matchAll(EVENT_END)) {
-    events.push([body.slice(start, end.index), end[0]]);
-    start = end.index + end[0].length;
-  }
-  if (start < body.length) events.push([body.slice(start), '']);
-  return events;
+function mapJson(text, mapMessage) {
+  const parsed = parseJson(text);
+  const messages = Array.isArray(parsed) ? parsed : [parsed];
+  const mapped = messages.map(mapMessage);
+  if (!mapped.some((message, index) => message !== messages[index])) return null;
+  return JSON.stringify(Array.isArray(parsed) ? mapped : mapped[0]);
 }
 
-/** The JSON-RPC messages of a JSON or SSE body (a batch counts as its messages). */
-function bodyMessages(body, contentType) {
-  const texts = isEventStream(contentType) ? splitEvents(body).map(([event]) => eventData(event)) : [body];
-  return texts.flatMap((text) => (text === null ? [] : [parseJson(text)].flat()));
-}
-
-/** Streamable HTTP answers with JSON or with an SSE stream of JSON-RPC messages. */
-function mapBody(body, contentType, mapMessage) {
-  const mapJson = (text) => {
-    const parsed = parseJson(text);
-    if (parsed === undefined) return null;
-    return JSON.stringify(Array.isArray(parsed) ? parsed.map(mapMessage) : mapMessage(parsed));
-  };
-  if (!isEventStream(contentType)) return mapJson(body) ?? body;
-  return splitEvents(body).map(([event, separator]) => {
-    const data = eventData(event);
-    const mapped = data === null ? null : mapJson(data);
-    if (mapped === null) return event + separator;
-    // The rewritten message goes on one data line; the event's other fields stay as they were.
-    const fields = event.split(LINE_END).filter((line) => !line.startsWith('data:'));
-    return [...fields, 'data: ' + mapped].join('\n') + separator;
-  }).join('');
-}
-
-/** The JSON-RPC message answering `id` in a JSON or SSE body. */
-function findResponse(body, contentType, id) {
-  return bodyMessages(body, contentType).find((message) => isObject(message) && message.id === id && !message.method);
+function findResponse(text, id) {
+  return [parseJson(text)].flat().find((message) => isObject(message) && message.id === id && !message.method);
 }
 
 /** A real JSON-RPC tools/list_changed notification (not a request, response or text mentioning it). */
@@ -141,27 +112,28 @@ function hasListChangedNotification(text) {
     && (message.params === undefined || isObject(message.params) || Array.isArray(message.params)));
 }
 
-/** Observe complete SSE events without delaying or altering the stream sent to agy. */
-function listChangedEventTap(onChange) {
+/** Read complete SSE events across chunks while bounding an unfinished event. */
+function sseEventReader(onEvent) {
   const decoder = new StringDecoder('utf8');
   const eventEnd = new RegExp(EVENT_END.source, 'g');
   let pending = '';
   let oversized = false;
   let skipLf = false;
-  return new Transform({
-    transform(chunk, _encoding, callback) {
+  return {
+    write(chunk) {
       const text = decoder.write(chunk);
-      if (!text) return callback(null, chunk);
+      if (!text) return true;
       eventEnd.lastIndex = Math.max(0, pending.length - 3);
       // A CR at the end of the previous chunk may have completed the event.
       pending += skipLf && text.startsWith('\n') ? text.slice(1) : text;
       skipLf = false;
       let start = 0;
       let end;
+      let withinLimit = true;
       while ((end = eventEnd.exec(pending))) {
-        if (!oversized && end.index - start <= MAX_BUFFERED) {
-          const data = eventData(pending.slice(start, end.index));
-          if (data !== null && hasListChangedNotification(data)) onChange();
+        if (!oversized) {
+          if (end.index - start <= MAX_BUFFERED) onEvent(pending.slice(start, end.index));
+          else withinLimit = false;
         }
         oversized = false;
         start = eventEnd.lastIndex;
@@ -169,9 +141,44 @@ function listChangedEventTap(onChange) {
       }
       pending = pending.slice(start);
       if (pending.length > MAX_BUFFERED) {
+        withinLimit = false;
         oversized = true;
         pending = pending.slice(-3);
       }
+      return withinLimit;
+    },
+    remainder: () => pending + decoder.end(),
+  };
+}
+
+function mapSseStream(mapMessage) {
+  const stream = new Transform({
+    transform(chunk, _encoding, callback) {
+      callback(events.write(chunk) ? null : new Error('SSE event too large'));
+    },
+    flush(callback) {
+      callback(null, events.remainder());
+    },
+  });
+  const events = sseEventReader((event) => {
+    const data = eventData(event);
+    const mapped = data === null ? null : mapJson(data, mapMessage);
+    const body = mapped === null ? event
+      : [...event.split(LINE_END).filter((line) => !line.startsWith('data:')), 'data: ' + mapped].join('\n');
+    stream.push(body + '\n\n');
+  });
+  return stream;
+}
+
+/** Observe notifications without delaying or altering the original stream. */
+function listChangedEventTap(onChange) {
+  const events = sseEventReader((event) => {
+    const data = eventData(event);
+    if (data !== null && hasListChangedNotification(data)) onChange();
+  });
+  return new Transform({
+    transform(chunk, _encoding, callback) {
+      events.write(chunk);
       callback(null, chunk);
     },
   });
@@ -269,14 +276,14 @@ function createMcpRelay({ log = (line) => process.stderr.write(line + '\n') } = 
     };
   }
 
-  function forward(target, req, res, body, sessionId, { rewriteBody, mapResponse } = {}) {
+  function forward(target, req, res, body, sessionId, { rewriteBody, mapMessage } = {}) {
     const headers = withoutHopByHop(req.headers);
     headers.host = target.url.host;
     const payload = rewriteBody ?? body;
     if (rewriteBody || req.method === 'POST') headers['content-length'] = String(payload.length);
-    if (mapResponse) headers['accept-encoding'] = 'identity';
+    if (mapMessage) headers['accept-encoding'] = 'identity';
     const upstream = (target.url.protocol === 'https:' ? https : http).request(target.url, { method: req.method, headers }, (up) => {
-      if (!mapResponse) {
+      if (!mapMessage) {
         res.writeHead(up.statusCode, withoutHopByHop(up.headers));
         const contentType = up.headers['content-type']?.split(';')[0].trim().toLowerCase();
         // A notification on one MCP session's stream only concerns that session's tool list.
@@ -287,6 +294,17 @@ function createMcpRelay({ log = (line) => process.stderr.write(line + '\n') } = 
         up.on('error', () => res.destroy());
         return;
       }
+      const outHeaders = withoutHopByHop(up.headers);
+      delete outHeaders['content-encoding'];
+      up.on('error', () => res.destroy());
+      if (isEventStream(up.headers['content-type'])) {
+        delete outHeaders['content-length'];
+        res.writeHead(up.statusCode, outHeaders);
+        const mapped = mapSseStream(mapMessage);
+        mapped.on('error', () => res.destroy());
+        up.pipe(mapped).pipe(res);
+        return;
+      }
       const parts = [];
       let size = 0;
       up.on('data', (chunk) => {
@@ -294,11 +312,9 @@ function createMcpRelay({ log = (line) => process.stderr.write(line + '\n') } = 
         if (size > MAX_BUFFERED) up.destroy(new Error('response too large'));
         else parts.push(chunk);
       });
-      up.on('error', () => res.destroy());
       up.on('end', () => {
-        const out = Buffer.from(mapResponse(Buffer.concat(parts).toString('utf8'), up.headers['content-type']), 'utf8');
-        const outHeaders = withoutHopByHop(up.headers);
-        delete outHeaders['content-encoding'];
+        const text = Buffer.concat(parts).toString('utf8');
+        const out = Buffer.from(mapJson(text, mapMessage) ?? text, 'utf8');
         outHeaders['content-length'] = String(out.length);
         res.writeHead(up.statusCode, outHeaders);
         res.end(out);
@@ -322,6 +338,24 @@ function createMcpRelay({ log = (line) => process.stderr.write(line + '\n') } = 
       headers['content-length'] = String(payload.length);
       headers['accept-encoding'] = 'identity';
       const upstream = (target.url.protocol === 'https:' ? https : http).request(target.url, { method: 'POST', headers }, (up) => {
+        const accept = (message) => resolve(message && adoptToolList(target, sessionId, message.result) ? target.dirs.get(sessionId) : null);
+        up.on('error', () => resolve(null));
+        if (isEventStream(up.headers['content-type'])) {
+          let found = false;
+          const events = sseEventReader((event) => {
+            if (found) return;
+            const message = findResponse(eventData(event), id);
+            if (!message) return;
+            found = true;
+            accept(message);
+            up.destroy();
+          });
+          up.on('data', (chunk) => {
+            if (!events.write(chunk) && !found) up.destroy(new Error('SSE event too large'));
+          });
+          up.on('end', () => resolve(null));
+          return;
+        }
         const parts = [];
         let size = 0;
         up.on('data', (chunk) => {
@@ -329,11 +363,7 @@ function createMcpRelay({ log = (line) => process.stderr.write(line + '\n') } = 
           if (size > MAX_BUFFERED) up.destroy(new Error('response too large'));
           else parts.push(chunk);
         });
-        up.on('error', () => resolve(null));
-        up.on('end', () => {
-          const message = findResponse(Buffer.concat(parts).toString('utf8'), up.headers['content-type'], id);
-          resolve(message && adoptToolList(target, sessionId, message.result) ? target.dirs.get(sessionId) : null);
-        });
+        up.on('end', () => accept(findResponse(Buffer.concat(parts).toString('utf8'), id)));
       });
       upstream.on('error', () => resolve(null));
       upstream.end(payload);
@@ -410,10 +440,10 @@ function createMcpRelay({ log = (line) => process.stderr.write(line + '\n') } = 
         handleGatewayCall(target, req, res, message, sessionId).catch(() => res.destroy());
         return;
       }
-      const listsTools = [message].flat().some((m) => isObject(m) && m.method === 'tools/list');
-      if (listsTools && (target.rule || target.facadeCandidate)) {
+      const listIds = [message].flat().filter((m) => m?.method === 'tools/list' && m.id !== undefined).map((m) => m.id);
+      if (listIds.length && (target.rule || target.facadeCandidate)) {
         forward(target, req, res, body, sessionId, {
-          mapResponse: (text, contentType) => mapBody(text, contentType, (m) => mapToolList(target, sessionId, m)),
+          mapMessage: (m) => listIds.includes(m?.id) ? mapToolList(target, sessionId, m) : m,
         });
         return;
       }
