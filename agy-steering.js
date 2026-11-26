@@ -51,9 +51,15 @@ function supportsSteering(agentVersion) {
  * as soon as a new one takes over. Keep Cindy's original request open until
  * the newest prompt finishes and relay all of the session's streamed updates.
  */
-function attachSteering(input, output, child, stop) {
+function attachSteering(input, output, child, stop, options) {
+  const onActivity = typeof options?.onActivity === 'function' ? options.onActivity : null;
+  const notifyActivity = () => {
+    if (!onActivity) return;
+    try { onActivity(); } catch { /* ignore activity bookkeeping errors */ }
+  };
   const turns = new Map();
   const requests = new Map();
+  const promptRequests = new Set();
   const openingSessions = new Map();
   const mcpSessions = new Map();
   let nextSteerId = 0;
@@ -104,11 +110,16 @@ function attachSteering(input, output, child, stop) {
     }
 
     const turn = requests.get(message.id);
-    if (!turn) return line;
+    if (!turn) {
+      if (promptRequests.delete(message.id)) notifyActivity();
+      return line;
+    }
     requests.delete(message.id);
     if (message.id === turn.latestId) turn.result = message;
     if (--turn.pending !== 0) return null;
     turns.delete(turn.sessionId);
+    promptRequests.delete(turn.originalId);
+    notifyActivity();
     return encode({ ...turn.result, id: turn.originalId });
   });
 
@@ -117,6 +128,12 @@ function attachSteering(input, output, child, stop) {
     if (!message?.method || message.id === undefined) return line;
     const params = message.params;
     if (message.method === 'initialize') initializeId = message.id;
+    if (message.method === 'session/prompt') {
+      promptRequests.add(message.id);
+      notifyActivity();
+    } else if (message.method === '_session/steering') {
+      notifyActivity();
+    }
     if (isAntigravity && isSessionOpen(message.method)) {
       const servers = Array.isArray(params?.mcpServers) ? params.mcpServers : [];
       const serverNames = servers.map((server) => server?.name).filter((name) => typeof name === 'string' && name);

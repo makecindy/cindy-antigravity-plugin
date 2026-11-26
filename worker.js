@@ -48,6 +48,7 @@ const readline = require('node:readline');
 const maintain = require('./cli-installer.cjs');
 const { detectAgy, readCustomAgyConfig, runVersion, validateCustomPath, writeCustomAgyPath } = require('./resolve-agy.js');
 const { listModels, readModelSession, rememberModelSession } = require('./agy-models.js');
+const { clearFailedUsageCache, clearUsageCache, readUsage } = require('./agy-usage.js');
 const account = require('./agy-account.js');
 
 const HARNESS_ID = 'agy';
@@ -91,6 +92,7 @@ async function applyCustomPath(params) {
   const saved = writeCustomAgyPath(params.path);
   if (!saved.ok) return { ok: false, error: saved.error };
   usageRead = undefined;
+  clearUsageCache();
   accountStatusRead = undefined;
   // Like main.js, start the model listing of the new executable afresh.
   rememberModelSession(null);
@@ -119,7 +121,7 @@ const handlers = {
   },
   usage() {
     if (!usageRead) {
-      const read = require('./agy-usage.js').readUsage().catch(() => null).finally(() => {
+      const read = readUsage().catch(() => null).finally(() => {
         if (usageRead === read) usageRead = undefined;
       });
       usageRead = read;
@@ -138,7 +140,13 @@ const handlers = {
     return run.finally(() => { customPathPending -= 1; });
   },
   async account(params) {
-    return account.status(params).catch((error) => ({
+    return account.status(params).then((result) => {
+      if (result && result.supported === true) {
+        if (result.signedIn === false) clearUsageCache();
+        else if (result.signedIn === true) clearFailedUsageCache();
+      }
+      return result;
+    }, (error) => ({
       supported: true,
       error: 'status-failed',
       detail: String((error && error.message) || error).slice(0, 300),
@@ -151,7 +159,11 @@ const handlers = {
     if (!accountStatusRead) {
       // Callers share one check (one agy at a time), each with its own deadline.
       const sessionId = readModelSession();
-      const read = account.accountStatus(sessionId ? { sessionId } : {}).catch(() => null).finally(() => {
+      const read = account.accountStatus(sessionId ? { sessionId } : {}).then((result) => {
+        if (result && result.state === 'signed-out') clearUsageCache();
+        else if (result && result.state === 'signed-in') clearFailedUsageCache();
+        return result;
+      }, () => null).finally(() => {
         if (accountStatusRead === read) accountStatusRead = undefined;
       });
       accountStatusRead = read;
@@ -161,6 +173,7 @@ const handlers = {
   login() {
     if (customPathPending > 0) return Promise.resolve({ ok: false, error: 'busy' });
     usageRead = undefined;
+    clearUsageCache();
     if (activeLoginPromise) return Promise.resolve({ ok: false, error: 'busy' });
     const run = Promise.resolve(account.login(undefined, () => {
       reply({ jsonrpc: '2.0', method: 'progress', params: { stage: 'waiting-for-browser' } });
@@ -168,6 +181,7 @@ const handlers = {
       if (activeLoginPromise === run) activeLoginPromise = null;
       // A status read that started before the sign-in finished may describe the old state.
       accountStatusRead = undefined;
+      clearUsageCache();
     });
     activeLoginPromise = run;
     return run;
@@ -178,11 +192,17 @@ const handlers = {
   async logout() {
     if (customPathPending > 0) return { ok: false, error: 'busy' };
     usageRead = undefined;
-    return account.logout().finally(() => { accountStatusRead = undefined; });
+    clearUsageCache();
+    return account.logout().finally(() => {
+      accountStatusRead = undefined;
+      clearUsageCache();
+    });
   },
   async listModels(params) {
     return listModels(params).then((result) => {
       if (result && typeof result.sessionId === 'string') rememberModelSession(result.sessionId);
+      if (result && result.supported === false && result.reason === 'not-signed-in') clearUsageCache();
+      else if (result && result.supported === true && Array.isArray(result.models)) clearFailedUsageCache();
       return result;
     }, (error) => ({
       supported: true,
