@@ -77,6 +77,9 @@ agy --settings {"useG1Credits":false} acp --disable-telemetry
 - `--settings` 只对这次会话生效，不改你的 agy 配置：**订阅额度用完后不会使用付费的 Google AI 积分**，
   任务会报错停下。
 - `--disable-telemetry`：Cindy 启动的会话不向 Google 发送遥测。
+- 在设置页填写「HTTP 代理」（如 `http://127.0.0.1:7890`）后，之后启动的 agy 都带上 `HTTP_PROXY` / `HTTPS_PROXY`，
+  `localhost`、`127.0.0.1`、`::1` 保持直连（登录回调与本机 MCP）。地址和自定义路径存在同一个 `config.json`，
+  只接受 `http://` / `https://` 加主机和端口，不保存账号密码；不发布给 Cindy。清除后 agy 沿用继承的环境变量。
 - 参数都是插件里的常量，不拼接任何用户输入。Windows 上若 agy 是 `.cmd` 包装，常量按 C 运行库规则加引号
   经 `cmd.exe` 传入（常量里没有 cmd.exe 会展开的字符，加载时校验）。
 
@@ -120,14 +123,14 @@ agy --settings {"useG1Credits":false} acp --disable-telemetry
 | --- | --- |
 | `ghost.json` | 清单：`node` 工作进程、额外入口 `agy-acp.js`、`harnesses` 声明、设置页、常驻逻辑页 |
 | `main.js` | 逻辑页：检测 agy、读取模型与模式，`PUT /harnesses` 发布可用状态 |
-| `worker.js` | Node 工作进程（json-rpc-stdio），提供 `detect`、`setCustomPath`、`listModels`、`account`、`accountStatus`、`login`、`cancelLogin`、`logout`、`usage` |
+| `worker.js` | Node 工作进程（json-rpc-stdio），提供 `detect`、`setCustomPath`、`setHttpProxy`、`listModels`、`account`、`accountStatus`、`login`、`cancelLogin`、`logout`、`usage` |
 | `resolve-agy.js` | 查找与启动 agy 的共用代码（worker 与 ACP 入口用同一套自定义路径、查找顺序与参数） |
 | `agy-client.js` | 插件自用的短时 ACP 连接（启动 agy、`initialize`、调用、停止） |
 | `agy-models.js` | 经 ACP 读取模型、每个模型的思考深度、agy 的工作模式与订阅档位 |
 | `agy-account.js` | 经 ACP 查询登录状态、用 Google 登录、取消登录、退出登录 |
 | `agy-acp.js` | ACP 引擎入口：启动 `agy acp`，双向转发 ACP，支持插话时转换请求 |
 | `remote-workspace.js` | 任务文件在另一台电脑时：受限 Agent 的定义、两段式启动，以及读懂 ACP 的转接 |
-| `settings.html` / `settings.js` | 设置页：检测结果、版本、位置、自定义路径、安装提示、账号（登录 / 退出）与「重新检测」 |
+| `settings.html` / `settings.js` | 设置页：检测结果、版本、位置、自定义路径、HTTP 代理、安装提示、账号（登录 / 退出）与「重新检测」 |
 | `locales/` | 清单名称与说明的英文、简体中文文案 |
 | `test/bridge.test.mjs` | 用假 agy 验证检测、自定义路径、转发、参数与发布（`node --test test/bridge.test.mjs`） |
 
@@ -171,5 +174,5 @@ node --test test/bridge.test.mjs
 - 未登录在读取模型（Cindy 启动、打开模型选择器）或打开设置页时发现；在终端里登出后，Cindy 要到下次检查才知道。
 - 只提供 Google 个人账号登录；agy 公布的 Gemini Enterprise、Gemini API Key（按量计费）、Agent Platform 登录方式没有接入。
 - agy 在任务中自己切换模式时（例如规划结束后），Cindy 的权限菜单不会跟着变。
-- Cindy 给插件 Node 进程的环境变量是精简过的，只写在 shell 配置里的代理等变量不会传给 agy。
+- Cindy 给插件 Node 进程的环境变量是精简过的，只写在 shell 配置里的代理等变量不会传给 agy；需要代理时请在设置页填写「HTTP 代理」。
 - 插件图标取自 Antigravity 官网（antigravity.google/assets/image/antigravity-logo.png），标志归 Google 所有。

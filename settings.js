@@ -81,6 +81,17 @@
         'write-failed': '无法保存路径配置，请检查目录权限。',
         failed: '保存路径失败，请稍后重试。',
       },
+      httpProxy: 'HTTP 代理',
+      httpProxyPlaceholder: '留空则不为 agy 设置代理',
+      httpProxyReset: '清除',
+      httpProxySaved: '已保存，新开的 Antigravity 任务会通过这个代理连接。',
+      httpProxyCleared: '已清除代理。',
+      httpProxyErrors: {
+        'invalid-proxy': '请填写 http:// 或 https:// 开头的地址，例如 http://127.0.0.1:7890，不支持账号密码。',
+        'config-invalid': '配置文件无法读取，请重新保存自定义路径或点「恢复自动」。',
+        'write-failed': '无法保存代理配置，请检查目录权限。',
+        failed: '保存代理失败，请稍后重试。',
+      },
     },
     en: {
       checking: 'Checking…',
@@ -146,6 +157,17 @@
         'write-failed': 'Could not save the path configuration.',
         failed: 'Could not save the custom path. Try again.',
       },
+      httpProxy: 'HTTP proxy',
+      httpProxyPlaceholder: 'Leave blank to set no proxy for agy',
+      httpProxyReset: 'Clear',
+      httpProxySaved: 'Saved. New Antigravity tasks connect through this proxy.',
+      httpProxyCleared: 'Proxy cleared.',
+      httpProxyErrors: {
+        'invalid-proxy': 'Enter an address that starts with http:// or https://, such as http://127.0.0.1:7890. Credentials are not supported.',
+        'config-invalid': 'The config file could not be read. Save the custom path again or switch back to auto-detect.',
+        'write-failed': 'Could not save the proxy configuration.',
+        failed: 'Could not save the proxy. Try again.',
+      },
     },
   };
 
@@ -159,6 +181,9 @@
   var customPathPending = null;
   var customPathDirty = false;
   var customPathNote = null;
+  var httpProxyPending = null;
+  var httpProxyDirty = false;
+  var httpProxyNote = null;
   var cliBusy = false;
   /** Last account view from main.js: { signedIn, tier?, canSignIn, canSignOut, busy }. */
   var accountState = null;
@@ -260,6 +285,7 @@
 
     $('foot').textContent = t.foot;
     renderCustomPath();
+    renderHttpProxy();
     renderAccount();
   }
 
@@ -296,6 +322,34 @@
     noteEl.textContent = customPathNoteText(activeNote);
     noteEl.setAttribute('data-tone', activeNote && activeNote.tone === 'error' ? 'error' : 'neutral');
     show('custom-path-note', Boolean(activeNote));
+  }
+
+  function httpProxyNoteText(note) {
+    if (!note) return '';
+    if (note.key === 'saved') return t.httpProxySaved;
+    if (note.key === 'cleared') return t.httpProxyCleared;
+    return t.httpProxyErrors[note.key] || t[note.key] || t.httpProxyErrors.failed;
+  }
+
+  function renderHttpProxy() {
+    var saved = (snapshot && snapshot.result && snapshot.result.httpProxy) || '';
+    $('label-http-proxy').textContent = t.httpProxy;
+    var input = $('http-proxy-input');
+    input.placeholder = t.httpProxyPlaceholder;
+    if (!httpProxyDirty && !httpProxyPending) input.value = saved;
+    var locked = Boolean(httpProxyPending);
+    input.disabled = locked;
+    var saveBtn = $('http-proxy-save');
+    saveBtn.textContent = httpProxyPending ? t.customPathSaving : t.customPathSave;
+    saveBtn.disabled = locked || (input.value || '').trim() === saved;
+    var resetBtn = $('http-proxy-reset');
+    resetBtn.textContent = t.httpProxyReset;
+    resetBtn.disabled = locked;
+    show('http-proxy-reset', Boolean(saved));
+    var noteEl = $('http-proxy-note');
+    noteEl.textContent = httpProxyNoteText(httpProxyNote);
+    noteEl.setAttribute('data-tone', httpProxyNote && httpProxyNote.tone === 'error' ? 'error' : 'neutral');
+    show('http-proxy-note', Boolean(httpProxyNote));
   }
 
   function accountInFlight(op) {
@@ -565,6 +619,67 @@
     });
   }
 
+  function adoptHttpProxySnapshot(next) {
+    snapshot = next;
+    error = next.ok ? null : { key: 'detectFailed', text: next.error };
+    if (next.account && typeof next.account === 'object') accountState = next.account;
+  }
+
+  function settleHttpProxy(state, message, fallbackErrorKey) {
+    if (httpProxyPending !== state) return;
+    httpProxyPending = null;
+    clearInterval(state.resend);
+    clearTimeout(state.deadline);
+    if (message && message.ok && message.snapshot && typeof message.snapshot === 'object') {
+      adoptHttpProxySnapshot(message.snapshot);
+      httpProxyDirty = false;
+      var saved = Boolean(message.snapshot.result && message.snapshot.result.httpProxy);
+      httpProxyNote = { key: saved ? 'saved' : 'cleared', tone: 'neutral' };
+      render();
+      return;
+    }
+    httpProxyNote = { key: (message && message.error) || fallbackErrorKey || 'failed', tone: 'error' };
+    renderHttpProxy();
+  }
+
+  function requestHttpProxy(rawProxy) {
+    if (httpProxyPending) return;
+    var state = {
+      reqId: 'h' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10),
+      proxy: typeof rawProxy === 'string' ? rawProxy : '',
+      acked: false,
+      sends: 0,
+      resend: null,
+      deadline: null,
+    };
+    httpProxyPending = state;
+    httpProxyNote = null;
+    renderHttpProxy();
+    if (!channel) {
+      settleHttpProxy(state, null, 'backgroundOff');
+      return;
+    }
+    state.deadline = setTimeout(function () { settleHttpProxy(state, null, 'timeout'); }, RESULT_TIMEOUT_MS);
+    var send = function () {
+      if (httpProxyPending !== state || state.acked) return;
+      if (state.sends >= MAX_SENDS) {
+        settleHttpProxy(state, null, 'backgroundOff');
+        return;
+      }
+      state.sends += 1;
+      channel.postMessage({ type: 'http-proxy-request', reqId: state.reqId, proxy: state.proxy });
+    };
+    wake().then(function (wakeState) {
+      if (httpProxyPending !== state) return;
+      if (wakeState === 'off' || wakeState === 'fused') {
+        settleHttpProxy(state, null, 'backgroundOff');
+        return;
+      }
+      send();
+      state.resend = setInterval(send, RESEND_INTERVAL_MS);
+    });
+  }
+
   if (channel) {
     channel.onmessage = function (event) {
       var data = event && event.data;
@@ -618,6 +733,24 @@
         }
         return;
       }
+      if (data.type === 'http-proxy-ack') {
+        if (httpProxyPending && data.reqId === httpProxyPending.reqId) {
+          httpProxyPending.acked = true;
+          clearInterval(httpProxyPending.resend);
+        }
+        return;
+      }
+      if (data.type === 'http-proxy-result') {
+        if (httpProxyPending && data.reqId === httpProxyPending.reqId) {
+          settleHttpProxy(httpProxyPending, data);
+        } else if (data.ok && data.snapshot && data.snapshot.result) {
+          // Saved from another window: that is the current proxy.
+          adoptHttpProxySnapshot(data.snapshot);
+          if (!httpProxyPending) httpProxyDirty = false;
+          render();
+        }
+        return;
+      }
       if (data.type === 'account-ack') {
         var acked = accountRequests[data.reqId];
         if (acked) {
@@ -657,6 +790,26 @@
     $('custom-path-input').value = '';
     customPathDirty = false;
     requestCustomPath('');
+  });
+
+  $('http-proxy-input').addEventListener('input', function () {
+    httpProxyDirty = true;
+    httpProxyNote = null;
+    renderHttpProxy();
+  });
+  $('http-proxy-input').addEventListener('keydown', function (event) {
+    if (event && event.key === 'Enter' && !event.isComposing && !$('http-proxy-save').disabled) {
+      requestHttpProxy($('http-proxy-input').value || '');
+    }
+  });
+  $('http-proxy-save').addEventListener('click', function () {
+    if (!$('http-proxy-save').disabled) requestHttpProxy($('http-proxy-input').value || '');
+  });
+  $('http-proxy-reset').addEventListener('click', function () {
+    if ($('http-proxy-reset').disabled) return;
+    $('http-proxy-input').value = '';
+    httpProxyDirty = false;
+    requestHttpProxy('');
   });
 
   $('account-login').addEventListener('click', function () {
