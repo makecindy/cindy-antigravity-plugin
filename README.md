@@ -110,24 +110,39 @@ agy --settings {"useG1Credits":false} acp --disable-telemetry
 
 登录信息由 agy 保存在它自己的存储里（Windows 上是系统凭据管理器），插件与 Cindy 都不保存。
 
-支持引擎账号的 Cindy 会在 Antigravity 引擎下显示当前登录的订阅档位（例如 Google AI Ultra）。插件只上报
-这一个登录（`accountStatus`：是否已登录与订阅档位，读法同上面的「状态」，复用模型探测会话，不新建会话），同样不含
-邮箱。**不支持在 Cindy 里添加多个 Antigravity 账号**：agy 把 Google 登录存在系统凭据存储的固定位置，一台电脑只有
-一个登录，换 HOME 等目录也还是同一个账号（agy 1.5.14 实测），agy 本身也不支持多个 Google 账号。要换账号，请在
-设置页退出后用另一个 Google 账号登录。
+支持引擎账号的 Cindy 可以在「设置 → 模型供应商 → Antigravity」中像 Claude Code / Codex 一样管理并添加多个
+Google 账号，按账号池策略混用（最少占用、轮询、按顺序、按权重、余量最多）、限制并发、暂停、拆出为单独供应商，并在
+额度用尽、登录失效或服务繁忙时自动换号与冷却：
+
+- **默认登录**：插件设置页与终端里的 `agy` 仍使用系统默认登录（OS 凭据存储 + `~/.gemini/antigravity-cli`），
+  升级后无需重新登录。
+- **新增账号**：Cindy 为每个新增账号建独立目录，启动任务或登录时传入 `--cindy-account-dir <目录>` / `accountDir`。
+  插件以 `AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1` 和 `--gemini-dir <目录>/.gemini --app-data-dir antigravity-cli`
+  运行 `agy acp`（不改写用户 `HOME`，任务里的 git / ssh 等工具仍正常工作），把该账号的 OAuth 凭据文件、设置和
+  会话历史完全隔离在账号目录内；查询该账号 `/usage` 时以该目录为 `HOME`（Windows 同步设置 `USERPROFILE`）读取同一份
+  凭据。账号目录不存在或不可写时直接以非零状态退出（退出码 77），绝不回落到默认登录。远程工作区和分享模式同样按该
+  账号目录运行。
+- **身份与去重**：新增账号的 `accountStatus` 从账号目录内 agy 写入的凭据元数据读取非敏感的邮箱（`identity.email`）与
+  稳定摘要（`fingerprint`，由邮箱或 sub 哈希得到，不含任何令牌），供 Cindy 显示账号邮箱并在重复登录同一 Google 账号时
+  只计一次调度；套餐名称来自 ACP 订阅档位或凭据元数据。
+- **自动换号分类**：入口在 `session/new`、`session/load`、`session/resume`、`session/prompt` 失败回包里，把明确的
+  登录失效、额度耗尽（含未来重置时间，如有）与模型容量不足/限流标成 `error.data._meta.cindy`
+  （`auth-required` / `usage-limit` / `overloaded`），供 Cindy 冷却并切换到池内其他可用账号。
 
 | 文件 | 作用 |
 | --- | --- |
 | `ghost.json` | 清单：`node` 工作进程、额外入口 `agy-acp.js`、`harnesses` 声明、设置页、常驻逻辑页 |
-| `main.js` | 逻辑页：检测 agy、读取模型与模式，`PUT /harnesses` 发布可用状态 |
-| `worker.js` | Node 工作进程（json-rpc-stdio），提供 `detect`、`setCustomPath`、`listModels`、`account`、`accountStatus`、`login`、`cancelLogin`、`logout`、`usage` |
-| `resolve-agy.js` | 查找与启动 agy 的共用代码（worker 与 ACP 入口用同一套自定义路径、查找顺序与参数） |
+| `main.js` | 逻辑页：检测 agy、读取模型与模式，`PUT /harnesses` 发布可用状态与账号登录方式 |
+| `worker.js` | Node 工作进程（json-rpc-stdio），提供 `detect`、`setCustomPath`、`listModels`、`account`、`accountStatus`、`accountLogin`、`accountLoginCancel`、`login`、`cancelLogin`、`logout`、`usage` |
+| `resolve-agy.js` | 查找与启动 agy 的共用代码（worker 与 ACP 入口用同一套自定义路径、查找顺序、参数与账号目录环境） |
+| `agy-account-dir.js` | Cindy 新增账号目录的校验、路径布局（`.gemini/antigravity-cli`）与非敏感身份元数据读取 |
+| `agy-account-errors.js` | 为因账号/额度/繁忙失败的 ACP 会话与轮次回包补上 `error.data._meta.cindy` |
 | `agy-client.js` | 插件自用的短时 ACP 连接（启动 agy、`initialize`、调用、停止） |
 | `agy-models.js` | 经 ACP 读取模型、每个模型的思考深度、agy 的工作模式与订阅档位 |
-| `agy-account.js` | 经 ACP 查询登录状态、用 Google 登录、取消登录、退出登录 |
-| `agy-acp.js` | ACP 引擎入口：启动 `agy acp`，双向转发 ACP，支持插话时转换请求 |
-| `remote-workspace.js` | 任务文件在另一台电脑时：受限 Agent 的定义、两段式启动，以及读懂 ACP 的转接 |
-| `settings.html` / `settings.js` | 设置页：检测结果、版本、位置、自定义路径、安装提示、账号（登录 / 退出）与「重新检测」 |
+| `agy-account.js` | 经 ACP 查询登录状态、用 Google 登录、取消登录、退出登录（支持默认登录与独立账号目录） |
+| `agy-acp.js` | ACP 引擎入口：处理 `--cindy-account-dir`、启动 `agy acp`，双向转发 ACP，支持插话与错误分类 |
+| `remote-workspace.js` | 任务文件在另一台电脑时：受限 Agent 的定义、两段式启动、账号目录透传，以及读懂 ACP 的转接 |
+| `settings.html` / `settings.js` | 设置页：检测结果、版本、位置、自定义路径、安装提示、默认账号（登录 / 退出）与「重新检测」 |
 | `locales/` | 清单名称与说明的英文、简体中文文案 |
 | `test/bridge.test.mjs` | 用假 agy 验证检测、自定义路径、转发、参数与发布（`node --test test/bridge.test.mjs`） |
 

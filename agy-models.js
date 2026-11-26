@@ -16,9 +16,11 @@
  * `tier`. A session that cannot start because agy is not signed in reports `not-signed-in`.
  */
 
+const { randomBytes } = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { accountModelSessionFileOf } = require('./agy-account-dir.js');
 const { isSignInRequired, openAgy, tierFromMeta } = require('./agy-client.js');
 const { configFilePath } = require('./resolve-agy.js');
 
@@ -122,6 +124,9 @@ function probeFolder() {
 }
 
 function sessionFilePath(options) {
+  if (options && typeof options.accountDir === 'string' && options.accountDir) {
+    return accountModelSessionFileOf(options.accountDir, options);
+  }
   const config = configFilePath(options);
   return config ? path.join(path.dirname(config), SESSION_FILE_NAME) : null;
 }
@@ -150,7 +155,7 @@ function rememberModelSession(sessionId, options) {
     }
     if (typeof sessionId !== 'string' || !SESSION_ID.test(sessionId) || readModelSession(options) === sessionId) return;
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-    const tmp = `${file}.${process.pid}.${Math.random().toString(36).slice(2, 8)}.tmp`;
+    const tmp = `${file}.${process.pid}.${randomBytes(8).toString('hex')}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify({ sessionId }) + '\n', { encoding: 'utf8', mode: 0o600 });
     try {
       fs.renameSync(tmp, file);

@@ -712,10 +712,11 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
     const calls = (method) => nodeCalls.filter((call) => call.method === method);
     vm.runInContext(fs.readFileSync(path.join(root, 'main.js'), 'utf8'), context, { filename: 'main.js' });
 
-    // Start-up: agy is installed but refuses a session: unavailable with the sign-in hint.
-    await waitFor(() => puts.some((body) => body.harnesses[0].reason === 'not-signed-in'), 3_000, 'sign-in hint');
-    assert.deepEqual(puts.at(-1), { harnesses: [{ id: 'agy', available: false, reason: 'not-signed-in', version: '1.5.12',
-      message: 'Antigravity is not signed in. Open the Antigravity plugin settings and select Sign in with Google.' }] });
+    // Start-up: agy is installed; default login is signed out so the settings page sees signInRequired,
+    // while the engine stays available with its Google sign-in method so Cindy's account pool can sign in or add accounts.
+    await waitFor(() => puts.length >= 1, 3_000, 'initial publish');
+    assert.deepEqual(puts.at(-1), { harnesses: [{ id: 'agy', available: true, reportsUsage: true,
+      accounts: { methods: [{ id: 'oauth-personal', label: 'Google account', kind: 'browser' }] }, version: '1.5.12' }] });
 
     // Signed in, then "Check again": listed right away (no one-minute wait) and published with the modes.
     signedIn = true;
@@ -724,8 +725,8 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
     page.onmessage = (event) => received.push(event.data);
     page.postMessage({ type: 'detect-request', reqId: 'r1' });
     await waitFor(() => puts.some((body) => body.harnesses[0].modes), 3_000, 'models and modes published');
-    // Cindy may show agy's one login, but is never offered a way to add another (methods: []).
-    assert.deepEqual(puts.at(-1), { harnesses: [{ id: 'agy', available: true, reportsUsage: true, accounts: { methods: [] }, version: '1.5.12',
+    assert.deepEqual(puts.at(-1), { harnesses: [{ id: 'agy', available: true, reportsUsage: true,
+      accounts: { methods: [{ id: 'oauth-personal', label: 'Google account', kind: 'browser' }] }, version: '1.5.12',
       models: [{ id: 'gemini-4-neon', name: 'Gemini 4 Neon', efforts: ['low', 'medium', 'high', 'xhigh'], defaultEffort: 'high' }],
       modes: ['default', 'acceptEdits', 'auto', 'plan'], defaultMode: 'default' }] });
     assert.equal(calls('listModels').length, 2);
@@ -785,8 +786,8 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
 
     assert.deepEqual(await accountStatus(), { state: 'signed-out' });
     assert.equal((await call('login', {})).ok, true);
-    // Signed in before any model listing: there is no session to read the tier from, so no plan.
-    assert.deepEqual(await accountStatus(), { state: 'signed-in' });
+    // Right after sign-in, the worker already remembers the tier from authenticate even before listing models.
+    assert.deepEqual(await accountStatus(), { state: 'signed-in', plan: 'Google AI Pro' });
     assert.equal((await call('listModels', {})).sessionId, 'fake-session');
     const opened = sent('session/new');
     const resumed = sent('session/resume');
@@ -794,8 +795,8 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
     assert.equal(sent('session/new'), opened, 'accountStatus opened no session');
     assert.equal(sent('session/resume'), resumed + 1, 'accountStatus resumed the model-list session');
 
-    // Cindy can never add an Antigravity account: an account directory or another engine has no status.
-    assert.equal(await accountStatus({ harnessId: 'agy', accountDir: path.join(fixture.dir, 'account-1') }), null);
+    // A missing account directory or another engine id has no status.
+    assert.equal(await accountStatus({ harnessId: 'agy', accountDir: path.join(fixture.dir, 'missing-account') }), null);
     assert.equal(await accountStatus({ harnessId: 'other' }), null);
 
     assert.deepEqual(await call('logout', {}), { ok: true });
@@ -946,15 +947,18 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
     finishFirstListing();
     await waitFor(() => puts.length && puts.at(-1).models, 3_000, 'models read again after the sign-in');
     assert.ok(puts.every((entry) => entry.available), 'the late listing never marks the engine signed out');
-    assert.deepEqual(puts.at(-1), { id: 'agy', available: true, reportsUsage: true, accounts: { methods: [] }, version: '1.5.12',
+    assert.deepEqual(puts.at(-1), { id: 'agy', available: true, reportsUsage: true,
+      accounts: { methods: [{ id: 'oauth-personal', label: 'Google 账号', kind: 'browser' }] }, version: '1.5.12',
       models: [{ id: 'gemini-4-neon', name: 'Gemini 4 Neon' }] });
 
     page.postMessage({ type: 'account-request', reqId: 'a2', op: 'logout' });
     await waitFor(() => result('a2'), 3_000, 'sign-out result');
     assert.equal(calls('logout').length, 1);
     assert.equal(result('a2').account.signedIn, false);
-    assert.deepEqual(puts.at(-1), { id: 'agy', available: false, reason: 'not-signed-in', version: '1.5.12',
-      message: 'Antigravity 还没有登录。请打开 Antigravity 插件设置，点「用 Google 登录」。' });
+    // Signing out the default login updates the settings page state while keeping the engine available
+    // so Cindy's account pool and any added accounts stay usable.
+    assert.equal(puts.at(-1).available, true);
+    assert.deepEqual(puts.at(-1).accounts, { methods: [{ id: 'oauth-personal', label: 'Google 账号', kind: 'browser' }] });
   });
 
   // agy 的 logout 一调用就登出(2026-11-19 实测)：设置页只在用户确认后才发出退出请求。
