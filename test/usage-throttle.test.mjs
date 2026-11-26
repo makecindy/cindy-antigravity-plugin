@@ -9,6 +9,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const isWin = process.platform === 'win32';
+const { PassThrough } = await import('node:stream');
+const { attachSteering } = await import(pathToFileURL(path.join(root, 'agy-steering.js')).href);
 const usageMod = await import(pathToFileURL(path.join(root, 'agy-usage.js')).href);
 const {
   ACTIVE_TTL_MS,
@@ -32,21 +34,36 @@ const args = process.argv.slice(2);
 const countFile = process.env.FAKE_USAGE_COUNT_FILE;
 const failFile = process.env.FAKE_USAGE_FAIL_FILE;
 const resetFile = process.env.FAKE_USAGE_RESET_FILE;
+const startedFile = process.env.FAKE_USAGE_STARTED_FILE;
+const releaseFile = process.env.FAKE_USAGE_RELEASE_FILE;
 
 if (args.at(-1) === '/usage') {
   const prev = countFile && fs.existsSync(countFile) ? Number(fs.readFileSync(countFile, 'utf8')) || 0 : 0;
   const next = prev + 1;
   if (countFile) fs.writeFileSync(countFile, String(next));
-  if (failFile && fs.existsSync(failFile)) process.exit(1);
-  const resetTime = resetFile && fs.existsSync(resetFile) ? fs.readFileSync(resetFile, 'utf8').trim() : undefined;
-  const bucket = { window: '5h', remaining_fraction: Math.max(0, 1 - next * 0.1) };
-  if (resetTime) bucket.reset_time = resetTime;
-  process.stdout.write(JSON.stringify({
-    status: 'SUCCESS',
-    num_turns: 0,
-    command: { name: 'usage', data: { groups: [{ name: 'Gemini', buckets: [bucket] }] } },
-  }));
-  process.exit(0);
+  if (startedFile) fs.writeFileSync(startedFile, String(next));
+  const finish = () => {
+    if (failFile && fs.existsSync(failFile)) process.exit(1);
+    const resetTime = resetFile && fs.existsSync(resetFile) ? fs.readFileSync(resetFile, 'utf8').trim() : undefined;
+    const bucket = { window: '5h', remaining_fraction: Math.max(0, 1 - next * 0.1) };
+    if (resetTime) bucket.reset_time = resetTime;
+    process.stdout.write(JSON.stringify({
+      status: 'SUCCESS',
+      num_turns: 0,
+      command: { name: 'usage', data: { groups: [{ name: 'Gemini', buckets: [bucket] }] } },
+    }));
+    process.exit(0);
+  };
+  if (releaseFile && !fs.existsSync(releaseFile)) {
+    const poll = setInterval(() => {
+      if (fs.existsSync(releaseFile)) {
+        clearInterval(poll);
+        finish();
+      }
+    }, 10);
+  } else {
+    finish();
+  }
 }
 if (args.length === 1 && args[0] === '--version') {
   process.stdout.write('agy 1.5.18\\n');
@@ -391,5 +408,120 @@ describe('usage adaptive throttling and persistent cache', () => {
 
     const activityAt = readUsageActivity({ env: fixture.env });
     assert.ok(typeof activityAt === 'number' && activityAt > 0, 'remote session/prompt recorded usage activity');
+  });
+
+  test('in-flight usage probe invalidated by clearUsageCache or clearFailedUsageCache does not resurrect stale cache', async (t) => {
+    const fixture = makeEnvFixture(t);
+    const startedFile = path.join(fixture.dir, 'started.flag');
+    const releaseFile = path.join(fixture.dir, 'release.flag');
+    const env = { ...fixture.env, FAKE_USAGE_STARTED_FILE: startedFile, FAKE_USAGE_RELEASE_FILE: releaseFile };
+    const waitStarted = async (expected) => {
+      for (let i = 0; i < 200; i += 1) {
+        if (fs.existsSync(startedFile) && fs.readFileSync(startedFile, 'utf8').trim() === String(expected)) return;
+        await new Promise((r) => setTimeout(r, 15));
+      }
+      throw new Error(`probe ${expected} did not start in time`);
+    };
+
+    // Case 1: valid probe in flight when logout/login calls clearUsageCache -> discarded, disk stays empty.
+    const pendingValid = readUsage({ env });
+    await waitStarted(1);
+    clearUsageCache({ env });
+    fs.writeFileSync(releaseFile, 'go');
+    assert.equal(await pendingValid, null, 'invalidated in-flight probe must not return stale pre-clear quota');
+    assert.equal(readUsageCache({ env }), null, 'invalidated in-flight probe must not write stale cache to disk');
+
+    // Case 2: failing probe in flight when sign-in observes clearFailedUsageCache -> discarded, no failure backoff saved.
+    fs.rmSync(releaseFile, { force: true });
+    fs.writeFileSync(fixture.failFile, '1');
+    const pendingFail = readUsage({ env });
+    await waitStarted(2);
+    clearFailedUsageCache({ env });
+    fs.writeFileSync(releaseFile, 'go');
+    assert.equal(await pendingFail, null);
+    assert.equal(readUsageCache({ env }), null, 'stale signed-out failure probe must not save failure backoff');
+
+    // Case 3: worker logout racing an in-flight usage RPC leaves no resurrected cache on disk.
+    fs.rmSync(fixture.failFile, { force: true });
+    fs.rmSync(releaseFile, { force: true });
+    const worker = startWorker(env);
+    const usagePromise = worker.call({ jsonrpc: '2.0', id: 10, method: 'usage', params: {} });
+    await waitStarted(3);
+    const logoutPromise = worker.call({ jsonrpc: '2.0', id: 11, method: 'logout', params: {} });
+    const logoutRes = await logoutPromise;
+    assert.equal(logoutRes.result.ok, true);
+    fs.writeFileSync(releaseFile, 'go');
+    const usageRes = await usagePromise;
+    await worker.close();
+    assert.equal(usageRes.result, null);
+    assert.equal(readUsageCache({ env }), null, 'in-flight worker usage probe must not repopulate cache after logout');
+  });
+
+  test('long-running prompts refresh activity at bounded rate during streamed updates and stay on active TTL', async () => {
+    let clock = 1_750_000_000_000;
+    const activityTimestamps = [];
+    const clientIn = new PassThrough();
+    const clientOut = new PassThrough();
+    const child = { stdin: new PassThrough(), stdout: new PassThrough() };
+
+    const { detach } = attachSteering(clientIn, clientOut, child, () => {}, {
+      now: () => clock,
+      activityHeartbeatMs: 60_000,
+      onActivity: () => activityTimestamps.push(clock),
+    });
+
+    const sendFromClient = (msg) => clientIn.write(JSON.stringify(msg) + '\n');
+    const sendFromAgent = (msg) => child.stdout.write(JSON.stringify(msg) + '\n');
+    const tick = () => new Promise((r) => setImmediate(r));
+
+    // Streamed session/update before any prompt (e.g. session/load replay) is NOT billable activity.
+    sendFromAgent({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 's1', update: { sessionUpdate: 'agent_message_chunk' } } });
+    await tick();
+    assert.deepEqual(activityTimestamps, []);
+
+    // Prompt starts at t=0 -> immediate activity write.
+    const t0 = clock;
+    sendFromClient({ jsonrpc: '2.0', id: 1, method: 'session/prompt', params: { sessionId: 's1', prompt: [{ type: 'text', text: 'long task' }] } });
+    await tick();
+    assert.deepEqual(activityTimestamps, [t0]);
+
+    // Updates within 60s are coalesced (no extra writes).
+    clock += 30_000;
+    sendFromAgent({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 's1', update: { sessionUpdate: 'agent_message_chunk' } } });
+    await tick();
+    assert.deepEqual(activityTimestamps, [t0]);
+
+    // Usage refreshes mid-turn at t=+45s (checkedAt > t0).
+    const midTurnCheckedAt = t0 + 45_000;
+    const midTurnCache = {
+      executable: '/bin/agy',
+      checkedAt: midTurnCheckedAt,
+      usage: { updatedAt: midTurnCheckedAt, windows: [{ label: 'Gemini · 5h', remainingPercent: 80, windowMinutes: 300 }] },
+      consecutiveFailures: 0,
+    };
+
+    // Update at t=+60s (>= heartbeat interval) records fresh activity > midTurnCheckedAt.
+    clock = t0 + 60_000;
+    sendFromAgent({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 's1', update: { sessionUpdate: 'tool_call' } } });
+    await tick();
+    assert.deepEqual(activityTimestamps, [t0, t0 + 60_000]);
+
+    // 15 min after midTurnCheckedAt, the running prompt still qualifies for the 15m active TTL.
+    assert.equal(shouldRefreshUsage(midTurnCache, activityTimestamps.at(-1), midTurnCheckedAt + ACTIVE_TTL_MS, '/bin/agy'), true);
+
+    // Prompt ends -> records completion activity; subsequent stray updates without an active prompt do not record.
+    clock = t0 + 90_000;
+    sendFromAgent({ jsonrpc: '2.0', id: 1, result: { stopReason: 'end_turn' } });
+    await tick();
+    assert.deepEqual(activityTimestamps, [t0, t0 + 60_000, t0 + 90_000]);
+
+    clock = t0 + 200_000;
+    sendFromAgent({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 's1', update: { sessionUpdate: 'agent_message_chunk' } } });
+    await tick();
+    assert.deepEqual(activityTimestamps, [t0, t0 + 60_000, t0 + 90_000]);
+
+    detach();
+    clientIn.end();
+    child.stdout.end();
   });
 });

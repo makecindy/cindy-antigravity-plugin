@@ -231,9 +231,18 @@ const NEWLINE = Buffer.from('\n');
  */
 function startRemoteWorkspace(agyPath, host) {
   const { acpArgs, spawnAgy, killTree, exitAfterStderr, describe, exitCodeFor, timings } = host;
+  const nowFn = typeof host.now === 'function' ? host.now : Date.now;
+  const activityHeartbeatMs = typeof host.activityHeartbeatMs === 'number' && host.activityHeartbeatMs >= 0
+    ? host.activityHeartbeatMs
+    : 60_000;
+  let lastActivityNotifiedAt = 0;
   const notifyActivity = typeof host.onActivity === 'function'
-    ? () => { try { host.onActivity(); } catch { /* ignore */ } }
+    ? () => { lastActivityNotifiedAt = nowFn(); try { host.onActivity(); } catch { /* ignore */ } }
     : null;
+  const notifyProgressIfDue = () => {
+    if (!notifyActivity || activePrompts.size === 0) return;
+    if (nowFn() - lastActivityNotifiedAt >= activityHeartbeatMs) notifyActivity();
+  };
   let dir;
   try {
     dir = prepareLaunchDir();
@@ -452,6 +461,9 @@ function startRemoteWorkspace(agyPath, host) {
     }
     if (message.id !== undefined && message.method === undefined && activePrompts.delete(message.id)) {
       if (notifyActivity) notifyActivity();
+    }
+    if (message.method === 'session/update' || message.method === 'session/request_permission') {
+      notifyProgressIfDue();
     }
     const params = isObject(message.params) ? message.params : null;
     const isPermission = message.method === 'session/request_permission' && message.id !== undefined;

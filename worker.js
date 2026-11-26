@@ -142,8 +142,12 @@ const handlers = {
   async account(params) {
     return account.status(params).then((result) => {
       if (result && result.supported === true) {
-        if (result.signedIn === false) clearUsageCache();
-        else if (result.signedIn === true) clearFailedUsageCache();
+        if (result.signedIn === false) {
+          usageRead = undefined;
+          clearUsageCache();
+        } else if (result.signedIn === true) {
+          clearFailedUsageCache();
+        }
       }
       return result;
     }, (error) => ({
@@ -160,8 +164,12 @@ const handlers = {
       // Callers share one check (one agy at a time), each with its own deadline.
       const sessionId = readModelSession();
       const read = account.accountStatus(sessionId ? { sessionId } : {}).then((result) => {
-        if (result && result.state === 'signed-out') clearUsageCache();
-        else if (result && result.state === 'signed-in') clearFailedUsageCache();
+        if (result && result.state === 'signed-out') {
+          usageRead = undefined;
+          clearUsageCache();
+        } else if (result && result.state === 'signed-in') {
+          clearFailedUsageCache();
+        }
         return result;
       }, () => null).finally(() => {
         if (accountStatusRead === read) accountStatusRead = undefined;
@@ -179,8 +187,9 @@ const handlers = {
       reply({ jsonrpc: '2.0', method: 'progress', params: { stage: 'waiting-for-browser' } });
     })).finally(() => {
       if (activeLoginPromise === run) activeLoginPromise = null;
-      // A status read that started before the sign-in finished may describe the old state.
+      // A status or usage read that started before the sign-in finished may describe the old state.
       accountStatusRead = undefined;
+      usageRead = undefined;
       clearUsageCache();
     });
     activeLoginPromise = run;
@@ -195,14 +204,19 @@ const handlers = {
     clearUsageCache();
     return account.logout().finally(() => {
       accountStatusRead = undefined;
+      usageRead = undefined;
       clearUsageCache();
     });
   },
   async listModels(params) {
     return listModels(params).then((result) => {
       if (result && typeof result.sessionId === 'string') rememberModelSession(result.sessionId);
-      if (result && result.supported === false && result.reason === 'not-signed-in') clearUsageCache();
-      else if (result && result.supported === true && Array.isArray(result.models)) clearFailedUsageCache();
+      if (result && result.supported === false && result.reason === 'not-signed-in') {
+        usageRead = undefined;
+        clearUsageCache();
+      } else if (result && result.supported === true && Array.isArray(result.models)) {
+        clearFailedUsageCache();
+      }
       return result;
     }, (error) => ({
       supported: true,

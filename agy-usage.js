@@ -30,6 +30,26 @@ const CACHE_FILE_NAME = 'usage-cache.json';
 const ACTIVITY_FILE_NAME = 'usage-activity.json';
 const MAX_CACHE_BYTES = 16 * 1024;
 const MAX_ACTIVITY_BYTES = 1024;
+const MAX_GENERATION_KEYS = 64;
+const cacheGenerations = new Map();
+
+function getCacheGenerations(file) {
+  return cacheGenerations.get(file || '') || { all: 0, fail: 0 };
+}
+
+function bumpCacheGeneration(file, kind) {
+  const key = file || '';
+  const current = getCacheGenerations(key);
+  const next = kind === 'all'
+    ? { all: current.all + 1, fail: current.fail + 1 }
+    : { all: current.all, fail: current.fail + 1 };
+  cacheGenerations.delete(key);
+  cacheGenerations.set(key, next);
+  if (cacheGenerations.size > MAX_GENERATION_KEYS) {
+    const oldest = cacheGenerations.keys().next().value;
+    if (oldest !== undefined) cacheGenerations.delete(oldest);
+  }
+}
 
 /**
  * The length of a quota window from its period as agy reports it (`5h` → 300, `weekly` → 10080), so
@@ -171,6 +191,7 @@ function writeUsageCache(entry, options) {
 
 function clearUsageCache(options) {
   const file = cacheFilePath(options);
+  bumpCacheGeneration(file, 'all');
   if (!file) return;
   try {
     fs.rmSync(file, { force: true });
@@ -181,8 +202,16 @@ function clearUsageCache(options) {
 
 /** Clears a cached failed/signed-out entry once sign-in is observed, without dropping valid quota data. */
 function clearFailedUsageCache(options) {
+  const file = cacheFilePath(options);
+  bumpCacheGeneration(file, 'fail');
   const cached = readUsageCache(options);
-  if (cached && cached.usage === null) clearUsageCache(options);
+  if (cached && cached.usage === null && file) {
+    try {
+      fs.rmSync(file, { force: true });
+    } catch {
+      // best effort
+    }
+  }
 }
 
 function recordUsageActivity(options) {
@@ -265,16 +294,27 @@ async function readUsage(options) {
   if (!executable) return null;
   const nowFn = typeof options?.now === 'function' ? options.now : Date.now;
   const now = nowFn();
+  const file = cacheFilePath(options);
   const cached = readUsageCache(options);
   const activityAt = readUsageActivity(options);
   if (!options?.force && !shouldRefreshUsage(cached, activityAt, now, executable, options)) {
     return cached.usage;
   }
+  const startGen = getCacheGenerations(file);
   const usage = await probeUsage(executable, options, nowFn);
+  const currentGen = getCacheGenerations(file);
+  // Discard results from probes started before an account/path invalidation so a late probe
+  // cannot resurrect old quota data or a stale signed-out failure entry on disk.
+  if (currentGen.all !== startGen.all || resolveAgy(options) !== executable) {
+    return null;
+  }
   const checkedAt = nowFn();
   if (usage) {
     writeUsageCache({ executable, checkedAt, usage, consecutiveFailures: 0 }, options);
     return usage;
+  }
+  if (currentGen.fail !== startGen.fail) {
+    return null;
   }
   const prevFailures = cached && cached.executable === executable && cached.usage === null
     ? cached.consecutiveFailures

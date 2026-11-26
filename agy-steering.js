@@ -51,11 +51,27 @@ function supportsSteering(agentVersion) {
  * as soon as a new one takes over. Keep Cindy's original request open until
  * the newest prompt finishes and relay all of the session's streamed updates.
  */
+const DEFAULT_ACTIVITY_HEARTBEAT_MS = 60_000;
+
 function attachSteering(input, output, child, stop, options) {
   const onActivity = typeof options?.onActivity === 'function' ? options.onActivity : null;
+  const nowFn = typeof options?.now === 'function' ? options.now : Date.now;
+  const activityHeartbeatMs = typeof options?.activityHeartbeatMs === 'number' && options.activityHeartbeatMs >= 0
+    ? options.activityHeartbeatMs
+    : DEFAULT_ACTIVITY_HEARTBEAT_MS;
+  let lastActivityNotifiedAt = 0;
   const notifyActivity = () => {
     if (!onActivity) return;
+    lastActivityNotifiedAt = nowFn();
     try { onActivity(); } catch { /* ignore activity bookkeeping errors */ }
+  };
+  const notifyProgressIfDue = () => {
+    if (!onActivity || (promptRequests.size === 0 && turns.size === 0)) return;
+    const now = nowFn();
+    if (now - lastActivityNotifiedAt >= activityHeartbeatMs) {
+      lastActivityNotifiedAt = now;
+      try { onActivity(); } catch { /* ignore activity bookkeeping errors */ }
+    }
   };
   const turns = new Map();
   const requests = new Map();
@@ -87,6 +103,9 @@ function attachSteering(input, output, child, stop, options) {
     const message = parse(line);
     if (!message) return line;
     if (message.method) {
+      if (message.method === 'session/update' || message.method === 'session/request_permission') {
+        notifyProgressIfDue();
+      }
       const normalized = isAntigravity && normalizeToolMessage(message);
       return normalized ? encode(normalized) : line;
     }
