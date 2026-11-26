@@ -195,7 +195,7 @@ describe('usage adaptive throttling and persistent cache', () => {
     // Activity before checkedAt does NOT switch to active TTL.
     assert.equal(shouldRefreshUsage(noResetCache, t0 - 1000, t0 + ACTIVE_TTL_MS, exe), false);
 
-    // Activity after checkedAt switches to 15 min active TTL.
+    // Activity after checkedAt switches to 5 min active TTL.
     assert.equal(shouldRefreshUsage(noResetCache, t0 + 60_000, t0 + ACTIVE_TTL_MS - 1, exe), false);
     assert.equal(shouldRefreshUsage(noResetCache, t0 + 60_000, t0 + ACTIVE_TTL_MS, exe), true);
 
@@ -225,7 +225,7 @@ describe('usage adaptive throttling and persistent cache', () => {
     assert.equal(shouldRefreshUsage(soonResetCache, null, t0 + 2 * 60_000, exe), false);
     assert.equal(shouldRefreshUsage(soonResetCache, null, t0 + RESET_MIN_INTERVAL_MS, exe), true);
 
-    // Failure backoff: 15m -> 30m -> 60m cap.
+    // Failure backoff: 5m -> 10m -> 20m -> 40m -> 60m cap.
     const fail1 = { executable: exe, checkedAt: t0, usage: null, consecutiveFailures: 1 };
     assert.equal(shouldRefreshUsage(fail1, t0 + 1000, t0 + FAILURE_BACKOFF_INITIAL_MS - 1, exe), false);
     assert.equal(shouldRefreshUsage(fail1, t0 + 1000, t0 + FAILURE_BACKOFF_INITIAL_MS, exe), true);
@@ -257,7 +257,7 @@ describe('usage adaptive throttling and persistent cache', () => {
     assert.equal(fixture.readCount(), 1);
     assert.deepEqual(idleHit, first);
 
-    // 3. Antigravity task runs at +25m -> active TTL (15m) is already satisfied (25m >= 15m).
+    // 3. Antigravity task runs at +25m -> active TTL (5m) is already satisfied (25m >= 5m).
     clock += 5 * 60_000;
     recordUsageActivity(opts);
     clock += 1_000;
@@ -265,7 +265,7 @@ describe('usage adaptive throttling and persistent cache', () => {
     assert.equal(fixture.readCount(), 2);
     assert.equal(activeRefresh.windows[0].remainingPercent, 80);
 
-    // 4. Another task runs 2 min later, but still inside 15m active cooldown -> zero spawns.
+    // 4. Another task runs 2 min later, but still inside 5m active cooldown -> zero spawns.
     clock += 2 * 60_000;
     recordUsageActivity(opts);
     clock += 60_000;
@@ -273,8 +273,8 @@ describe('usage adaptive throttling and persistent cache', () => {
     assert.equal(fixture.readCount(), 2);
     assert.deepEqual(activeCooldownHit, activeRefresh);
 
-    // 5. After 15m from activeRefresh (with recorded activity after it) -> refreshes once.
-    clock += 13 * 60_000;
+    // 5. After 5m from activeRefresh (with recorded activity after it) -> refreshes once.
+    clock += 2 * 60_000;
     const activeSecondRefresh = await readUsage(opts);
     assert.equal(fixture.readCount(), 3);
     assert.equal(activeSecondRefresh.windows[0].remainingPercent, 70);
@@ -291,21 +291,21 @@ describe('usage adaptive throttling and persistent cache', () => {
     clearFailedUsageCache(opts);
     assert.ok(readUsageCache(opts)?.usage);
 
-    // 8. Failure caches null with exponential backoff (15m -> 30m) and clears on clearFailedUsageCache.
+    // 8. Failure caches null with exponential backoff (5m -> 10m) and clears on clearFailedUsageCache.
     fs.writeFileSync(fixture.failFile, '1');
     clearUsageCache(opts);
     assert.equal(await readUsage(opts), null);
     assert.equal(fixture.readCount(), 5);
-    clock += 10 * 60_000;
+    clock += 4 * 60_000;
     assert.equal(await readUsage(opts), null);
     assert.equal(fixture.readCount(), 5);
-    clock += 5 * 60_000;
+    clock += 60_000;
     assert.equal(await readUsage(opts), null);
     assert.equal(fixture.readCount(), 6);
     assert.equal(readUsageCache(opts)?.consecutiveFailures, 2);
 
-    // 2nd failure backs off for 30 min; clearing failed cache unblocks immediately.
-    clock += 20 * 60_000;
+    // 2nd failure backs off for 10 min; clearing failed cache unblocks immediately.
+    clock += 9 * 60_000;
     assert.equal(await readUsage(opts), null);
     assert.equal(fixture.readCount(), 6);
     fs.rmSync(fixture.failFile, { force: true });
@@ -506,7 +506,7 @@ describe('usage adaptive throttling and persistent cache', () => {
     await tick();
     assert.deepEqual(activityTimestamps, [t0, t0 + 60_000]);
 
-    // 15 min after midTurnCheckedAt, the running prompt still qualifies for the 15m active TTL.
+    // 5 min after midTurnCheckedAt, the running prompt still qualifies for the 5m active TTL.
     assert.equal(shouldRefreshUsage(midTurnCache, activityTimestamps.at(-1), midTurnCheckedAt + ACTIVE_TTL_MS, '/bin/agy'), true);
 
     // Prompt ends -> records completion activity; subsequent stray updates without an active prompt do not record.

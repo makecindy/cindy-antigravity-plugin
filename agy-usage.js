@@ -15,15 +15,15 @@ const PERIOD_UNITS = {
 const MAX_WINDOW_MINUTES = 527040;
 /**
  * Persistent throttling across `on-demand` worker restarts (worker exits after 30 s idle):
- * - Active (at least one Antigravity prompt ran since the last check): at most once every 15 min.
+ * - Active (at least one Antigravity prompt ran since the last check): at most once every 5 min.
  * - Idle (no Antigravity task ran since the last check): at most once every 60 min.
  * - Window reset boundary crossed since the last check: allow one re-check after 5 min.
- * - Failure / signed-out null reads: exponential backoff 15 min → 30 min → 60 min.
+ * - Failure / signed-out null reads: exponential backoff 5 min → 10 min → 20 min → 40 min → 60 min.
  */
-const ACTIVE_TTL_MS = 15 * 60_000;
+const ACTIVE_TTL_MS = 5 * 60_000;
 const IDLE_TTL_MS = 60 * 60_000;
 const RESET_MIN_INTERVAL_MS = 5 * 60_000;
-const FAILURE_BACKOFF_INITIAL_MS = 15 * 60_000;
+const FAILURE_BACKOFF_INITIAL_MS = 5 * 60_000;
 const FAILURE_BACKOFF_MAX_MS = 60 * 60_000;
 const FUTURE_CLOCK_SKEW_MS = 60_000;
 const CACHE_FILE_NAME = 'usage-cache.json';
