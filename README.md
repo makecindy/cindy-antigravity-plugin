@@ -143,7 +143,7 @@ agy --settings {"useG1Credits":false} acp --disable-telemetry
 
 ## 插话
 
-支持插话的 Cindy 客户端可在本机 Antigravity CLI 1.5.0 或更新的 1.x 正式版任务运行中追加消息。插件将插话转成并发 ACP prompt，并保持原任务运行到最后一条回复结束。远程工作区仍按顺序排队。
+支持插话的 Cindy 客户端可在 Antigravity CLI 1.5.0 或更新的 1.x 正式版任务运行中追加消息（本机任务与远程 / 分享工作区均适用）。插件将插话转成并发 ACP prompt，并保持原任务运行到最后一条回复结束。
 
 ## 发布新版本
 
