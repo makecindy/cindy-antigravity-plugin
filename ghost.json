@@ -4,7 +4,7 @@
   "name": "Antigravity",
   "description": "Run Cindy tasks with the Google Antigravity CLI (agy) installed on this computer.",
   "version": "0.6.0",
-  "releaseNotes": "支持在 Cindy 中添加多个 Antigravity（Google）账号并按账号池混用：每个新增账号使用独立目录与文件凭据存储，互不覆盖系统默认登录，支持按账号读取身份/套餐/用量，以及额度用尽、登录失效或服务繁忙时的自动换号与冷却。",
+  "releaseNotes": "Antigravity accounts are now managed in Settings → Model Providers: add several Google accounts, see each one’s usage and let Cindy share tasks between them, with automatic switching when one runs out or needs a new sign-in. The plugin settings page keeps the CLI setup and points there.",
   "minCindyVersion": "0.0.0",
   "githubRelease": "makecindy/cindy-antigravity-plugin",
   "icon": "icon.png",

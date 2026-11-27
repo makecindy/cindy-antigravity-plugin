@@ -9,8 +9,8 @@
 选中后每个任务启动一个 `agy acp` 进程，用 [Agent Client Protocol](https://agentclientprotocol.com) v1
 与它对话。
 
-插件负责「找到 agy、报告能不能用、列出 agy 提供的模型、思考深度与工作模式、在设置页登录 / 退出、
-把字节原样转发」。它不安装、不分发 agy，也不接触任何账号凭证：登录由 agy 自己管理。
+插件负责「找到 agy、报告能不能用、列出 agy 提供的模型、思考深度与工作模式、为 Cindy 的账号管理登录 agy、
+把字节原样转发」。它不安装、不分发 agy；登录由 agy 自己完成并保存，账号在 Cindy 的「设置 → 模型供应商」里添加和管理。
 
 ## 安装与更新
 
@@ -23,7 +23,7 @@
 
 ## 账号用量
 
-设置页显示当前 Google 账号各模型组的剩余额度和重置时间。数据来自本机 agy 的原生 `/usage` 命令，查询不会发起模型对话。支持插件用量的 Cindy 也会在使用此引擎的任务输入框下方显示用量，点击可看明细。旁边的圆环显示当前任务由引擎上报的上下文占用。额度周期能明确识别时（如 `5h`、`weekly`），用量里会一并带上窗口时长（`windowMinutes`），供 Cindy 判断哪份额度更快重置；认不出的周期不带。
+Cindy 在「设置 → 模型供应商 → Antigravity」里逐账号显示各模型组的剩余额度和重置时间，也会在使用此引擎的任务输入框下方显示用量，点击可看明细；插件设置页不再显示用量。数据来自本机 agy 的原生 `/usage` 命令，查询不会发起模型对话。旁边的圆环显示当前任务由引擎上报的上下文占用。额度周期能明确识别时（如 `5h`、`weekly`），用量里会一并带上窗口时长（`windowMinutes`），供 Cindy 判断哪份额度更快重置；认不出的周期不带。
 
 ## 让自己的其他电脑使用与分享给朋友
 
@@ -60,7 +60,7 @@
 1. 支持插件执行引擎（清单 `harnesses` 字段与 `PUT /harnesses`，含模型的思考深度与 Agent 工作模式）的 Cindy。
    该能力仍在开发中；正式版发布后请把 `ghost.json` 的 `minCindyVersion` 改成第一个包含它的版本号。
 2. 安装 Antigravity 命令行（[antigravity.google](https://antigravity.google)）。Windows 上默认装在
-   `%LOCALAPPDATA%\agy\bin\agy.exe`，不需要加进 PATH。登录可以在插件设置页完成（见下），也可以在终端运行 `agy`。
+   `%LOCALAPPDATA%\agy\bin\agy.exe`，不需要加进 PATH。登录在 Cindy 的「设置 → 模型供应商 → Antigravity」里完成（见下），也可以在终端运行 `agy`。
 
 ## 本地安装（开发）
 
@@ -94,28 +94,31 @@ agy --settings {"useG1Credits":false} acp --disable-telemetry
 （只有这个 id），供查询登录状态时复用同一个会话读取订阅档位。从 0.4.x 升级后，逻辑页启动时把已存的 id 交给
 工作进程（工作进程已有记录时不覆盖，不启动 agy）。
 
-打开模型选择器时 Cindy 会请插件刷新（同一插件 10 分钟内最多一次）。agy 没有登录时，引擎显示为不可用，
-提示到插件设置页登录。
+打开模型选择器时 Cindy 会请插件刷新（同一插件 10 分钟内最多一次）。没有任何账号登录时引擎仍显示为可用，
+以便在「设置 → 模型供应商 → Antigravity」里登录或添加账号；插件设置页会提示去那里添加。
 
-## 账号：登录与退出
+## 账号
 
-插件设置页的「账号」区域经 ACP 操作 agy 自己的登录（agy 1.5.12 实测）：
+账号统一在 Cindy 的「设置 → 模型供应商 → Antigravity」里添加和管理。插件设置页不提供登录、退出和用量，只保留命令行的
+检测、安装与路径设置，并提示到模型供应商管理账号。所有账号平等：agy 原有的登录（终端里的 `agy` 也在用的那一份）和
+Cindy 新增的账号都是账号列表里的普通一行，按同一套策略分配任务。
 
-- **状态**：打开设置页或点「重新检测」时检查 agy 是否已登录，并显示 agy 报告的订阅档位（例如 Google AI Pro）。
-  拿不到登录邮箱：ACP 不提供，插件也不读 agy 的凭证或日志。
-- **用 Google 登录**：发 `authenticate`（`oauth-personal`），agy 自己打开浏览器走 Google 登录，完成后返回；
-  最多等 5 分钟，等待期间可以「取消登录」（结束这次的 agy 进程）。登录成功后立即恢复引擎并重新读取模型。
-- **退出登录**：先在页面上确认，再发 `logout`。agy 的 `logout` 不校验参数、一调用就登出，所以插件只在确认后发送。
-  退出后 Cindy 里的 Antigravity 和终端里的 agy 都需要重新登录。
+- **登录**：Cindy 调用工作进程的 `accountLogin`，插件发 `authenticate`（`oauth-personal`），agy 自己打开浏览器走 Google
+  登录，完成后返回；等待期间可以在 Cindy 里取消（结束这次的 agy 进程）。登录成功后立即重新读取模型。
+- **状态**：Cindy 调用 `accountStatus` 检查是否已登录，并显示 agy 报告的订阅档位（例如 Google AI Pro）。
+- **没有退出登录**：在 Cindy 里移除账号只是让 Cindy 不再使用它，登录和历史保留。要让 agy 原有的登录真正登出，请在终端的
+  `agy` 里操作。
 
-登录信息由 agy 保存在它自己的存储里（Windows 上是系统凭据管理器），插件与 Cindy 都不保存。
+登录信息由 agy 保存在它自己的存储里（原有登录在系统凭据存储，新增账号在各自的账号目录），Cindy 不保存。agy 1.5.18 的 ACP
+与 `/usage` 只给订阅档位、不给账号身份，所以新增账号的邮箱取自该账号目录里 agy 自己写的凭据文件：只取邮箱、显示名、
+档位和一个摘要，不返回、不记录令牌。原有登录的凭据在系统凭据存储里，插件不读，所以它只显示订阅档位。
 
 支持引擎账号的 Cindy 可以在「设置 → 模型供应商 → Antigravity」中像 Claude Code / Codex 一样管理并添加多个
 Google 账号，按账号池策略混用（最少占用、轮询、按顺序、按权重、余量最多）、限制并发、暂停、拆出为单独供应商，并在
 额度用尽、登录失效或服务繁忙时自动换号与冷却：
 
-- **默认登录**：插件设置页与终端里的 `agy` 仍使用系统默认登录（OS 凭据存储 + `~/.gemini/antigravity-cli`），
-  升级后无需重新登录。
+- **原有登录**：终端里的 `agy`、以及升级前在插件设置页登录的那一份，仍是系统默认登录（OS 凭据存储 + `~/.gemini/antigravity-cli`），
+  升级后无需重新登录，它作为一个普通账号出现在账号列表里。
 - **新增账号**：Cindy 为每个新增账号建独立目录，启动任务或登录时传入 `--cindy-account-dir <目录>` / `accountDir`。
   插件以 `AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1` 和 `--gemini-dir <目录>/.gemini --app-data-dir antigravity-cli`
   运行 `agy acp`（不改写用户 `HOME`，任务里的 git / ssh 等工具仍正常工作），把该账号的 OAuth 凭据文件、设置和
@@ -139,10 +142,10 @@ Google 账号，按账号池策略混用（最少占用、轮询、按顺序、�
 | `agy-account-errors.js` | 为因账号/额度/繁忙失败的 ACP 会话与轮次回包补上 `error.data._meta.cindy` |
 | `agy-client.js` | 插件自用的短时 ACP 连接（启动 agy、`initialize`、调用、停止） |
 | `agy-models.js` | 经 ACP 读取模型、每个模型的思考深度、agy 的工作模式与订阅档位 |
-| `agy-account.js` | 经 ACP 查询登录状态、用 Google 登录、取消登录、退出登录（支持默认登录与独立账号目录） |
+| `agy-account.js` | 经 ACP 查询登录状态、用 Google 登录、取消登录（支持原有登录与独立账号目录） |
 | `agy-acp.js` | ACP 引擎入口：处理 `--cindy-account-dir`、启动 `agy acp`，双向转发 ACP，支持插话与错误分类 |
 | `remote-workspace.js` | 任务文件在另一台电脑时：受限 Agent 的定义、两段式启动、账号目录透传，以及读懂 ACP 的转接 |
-| `settings.html` / `settings.js` | 设置页：检测结果、版本、位置、自定义路径、安装提示、默认账号（登录 / 退出）与「重新检测」 |
+| `settings.html` / `settings.js` | 设置页：检测结果、版本、位置、自定义路径、安装提示、到模型供应商管理账号的引导与「重新检测」 |
 | `locales/` | 清单名称与说明的英文、简体中文文案 |
 | `test/bridge.test.mjs` | 用假 agy 验证检测、自定义路径、转发、参数与发布（`node --test test/bridge.test.mjs`） |
 
