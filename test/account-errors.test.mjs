@@ -172,11 +172,13 @@ describe('agy-account-errors', () => {
     const okResult = { jsonrpc: '2.0', id: 11, result: { stopReason: 'end_turn' } };
     assert.equal(relay.response(okResult), okResult);
 
-    // Cancelled turns are never rewritten into usage-limit errors.
+    // Cancelled turns keep the cancelled result and flush the held warning so users still see it.
     relay.request({ jsonrpc: '2.0', id: 12, method: 'session/prompt', params: { sessionId: 's1', prompt: [] } });
     assert.deepEqual(relay.notification(warnMsg), { hold: true });
     const cancelled = { jsonrpc: '2.0', id: 12, result: { stopReason: 'cancelled' } };
-    assert.equal(relay.response(cancelled), cancelled);
+    const flushed = [];
+    assert.equal(relay.response(cancelled, (item) => flushed.push(item)), cancelled);
+    assert.deepEqual(flushed, [warnMsg]);
   });
 
   test('agy-acp end-to-end converts agy warning chunk + end_turn into classified usage-limit error in local mode', async (t) => {
@@ -199,7 +201,7 @@ rl.on('line', (line) => {
     }
     send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'sess-1', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '\\n⚠ ${QUOTA_MSG}\\n' } } } });
     send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'sess-1', update: { sessionUpdate: 'usage_update', used: 200, size: 100000 } } });
-    send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+    send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: promptCount === 3 ? 'cancelled' : 'end_turn' } });
   }
 });
 `;
@@ -231,6 +233,14 @@ rl.on('line', (line) => {
     assert.ok(bridge.lines.some((m) => m.params?.update?.content?.text === 'Partial work.'));
     assert.equal(bridge.lines.some((m) => m.params?.update?.content?.text?.includes('⚠')), false);
 
+    // Third prompt cancelled after warning: cancelled result is preserved and the held warning is flushed before it.
+    bridge.send({ jsonrpc: '2.0', id: 5, method: 'session/prompt', params: { sessionId: 'sess-1', prompt: [{ type: 'text', text: 'cancel me' }] } });
+    const resp3 = await waitFor(() => bridge.lines.find((m) => m.id === 5), 5_000, 'third prompt response');
+    assert.deepEqual(resp3.result, { stopReason: 'cancelled' });
+    const warnIdx = bridge.lines.findIndex((m) => m.params?.update?.content?.text?.includes('⚠'));
+    const cancelIdx = bridge.lines.findIndex((m) => m.id === 5);
+    assert.ok(warnIdx !== -1 && warnIdx < cancelIdx, 'held warning must be flushed before the cancelled response');
+
     bridge.child.stdin.end();
     await bridge.closed;
   });
@@ -241,6 +251,7 @@ const readline = require('node:readline');
 if (process.argv.includes('--version')) { console.log('1.5.18'); process.exit(0); }
 const rl = readline.createInterface({ input: process.stdin });
 const send = (msg) => process.stdout.write(JSON.stringify(msg) + '\\n');
+let promptCount = 0;
 rl.on('line', (line) => {
   const msg = JSON.parse(line);
   if (msg.method === 'initialize') {
@@ -248,8 +259,9 @@ rl.on('line', (line) => {
   } else if (msg.method === 'session/new') {
     send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'sess-r' } });
   } else if (msg.method === 'session/prompt') {
+    promptCount += 1;
     send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'sess-r', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '\\n⚠ ${QUOTA_MSG}\\n' } } } });
-    send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } });
+    send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: promptCount === 2 ? 'cancelled' : 'end_turn' } });
   }
 });
 `;
@@ -272,6 +284,13 @@ rl.on('line', (line) => {
     assert.equal(resp.error?.data?._meta?.cindy?.kind, 'usage-limit');
     assert.equal(typeof resp.error?.data?._meta?.cindy?.resetsAt, 'number');
     assert.equal(bridge.lines.some((m) => m.params?.update?.content?.text?.includes('⚠')), false);
+
+    bridge.send({ jsonrpc: '2.0', id: 4, method: 'session/prompt', params: { sessionId: 'sess-r', prompt: [{ type: 'text', text: 'cancel' }] } });
+    const respCancelled = await waitFor(() => bridge.lines.find((m) => m.id === 4), 5_000, 'remote cancelled prompt response');
+    assert.deepEqual(respCancelled.result, { stopReason: 'cancelled' });
+    const warnIdx = bridge.lines.findIndex((m) => m.params?.update?.content?.text?.includes('⚠'));
+    const cancelIdx = bridge.lines.findIndex((m) => m.id === 4);
+    assert.ok(warnIdx !== -1 && warnIdx < cancelIdx, 'held warning must be flushed before remote cancelled response');
 
     bridge.child.stdin.end();
     await bridge.closed;

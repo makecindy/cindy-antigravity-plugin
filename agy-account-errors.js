@@ -226,7 +226,7 @@ function accountErrorRelay(nowFn = Date.now) {
       return { hold: false, flush: [held.rawMessage] };
     },
 
-    response(message) {
+    response(message, onFlush) {
       if (!isObject(message) || message.method !== undefined || message.id === undefined) return message;
       const tracked = pending.get(message.id);
       if (!tracked) return message;
@@ -247,7 +247,10 @@ function accountErrorRelay(nowFn = Date.now) {
       }
 
       if (held && isObject(message.result)) {
-        if (message.result.stopReason === 'cancelled') return message;
+        if (message.result.stopReason === 'cancelled') {
+          if (typeof onFlush === 'function') onFlush(held.rawMessage);
+          return message;
+        }
         return {
           jsonrpc: '2.0',
           id: message.id,
@@ -263,6 +266,7 @@ function accountErrorRelay(nowFn = Date.now) {
         };
       }
 
+      if (held && typeof onFlush === 'function') onFlush(held.rawMessage);
       return message;
     },
   };
