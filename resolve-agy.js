@@ -414,7 +414,38 @@ function childEnv(agyPath, options) {
     parts.push(...fallbacks.filter(isDirectory));
   }
   out.PATH = uniqueAbsolute(ctx, parts).join(ctx.win ? ';' : ':');
+  if (!ctx.win) restoreSessionBus(out, ctx);
   return out;
+}
+
+/**
+ * On Linux agy keeps its Google sign-in in the Secret Service keyring, reached over the user's
+ * D-Bus session bus. Cindy starts plugin workers with a short environment allowlist without
+ * DBUS_SESSION_BUS_ADDRESS, and the Electron utility process then sets it to `disabled:`
+ * (Chromium's guard against D-Bus autolaunch). agy inherits that value, cannot open the keyring
+ * ("dbus: invalid bus address") and reports "not signed in" although `agy` in a terminal is
+ * signed in. When the address is missing or `disabled:`, point agy at the session bus socket
+ * in XDG_RUNTIME_DIR (default /run/user/<uid>); without that socket, drop the address so agy
+ * falls back to its own discovery. A real address set by the user is kept.
+ */
+function restoreSessionBus(out, ctx) {
+  const current = out.DBUS_SESSION_BUS_ADDRESS;
+  if (current && current.trim() !== 'disabled:') return;
+  const uid = typeof process.getuid === 'function' ? process.getuid() : null;
+  const runtime = envGet(ctx.env, 'XDG_RUNTIME_DIR', false) || (uid !== null ? '/run/user/' + uid : undefined);
+  const socket = runtime && path.posix.isAbsolute(runtime) ? path.posix.join(runtime, 'bus') : undefined;
+  let isSocket = false;
+  try {
+    isSocket = Boolean(socket) && fs.statSync(socket).isSocket();
+  } catch {
+    isSocket = false;
+  }
+  if (!isSocket) {
+    delete out.DBUS_SESSION_BUS_ADDRESS;
+    return;
+  }
+  out.DBUS_SESSION_BUS_ADDRESS = 'unix:path=' + socket;
+  if (!out.XDG_RUNTIME_DIR) out.XDG_RUNTIME_DIR = runtime;
 }
 
 function windowsSystemExe(env, name) {
