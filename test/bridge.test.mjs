@@ -2259,6 +2259,14 @@ test('native /usage preserves exhausted groups and ignores model turns and disab
   assert.equal(usageFromReport({ status: 'SUCCESS', num_turns: 1, command }), null);
 });
 
+async function waitUntil(check, ms = 2_000) {
+  const end = Date.now() + ms;
+  while (!check()) {
+    if (Date.now() > end) throw new Error('timed out waiting');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
 async function localRelay(t) {
   const { PassThrough } = await import('node:stream');
   const { default: steering } = await import('../agy-steering.js');
@@ -2314,7 +2322,12 @@ describe('Antigravity local ACP relay', () => {
         type: 'http', name, url: `http://127.0.0.1:4711/mcp/${name}`, headers: [{ name: 'Authorization', value: 'Bearer test-token' }],
       }));
       request(2, method, { mcpServers });
-      assert.deepEqual(server.at(-1).params.mcpServers, mcpServers);
+      // The session waits for the gateway relay to listen; `cindy` is then reached through it.
+      await waitUntil(() => server.at(-1)?.method === method);
+      const [relayed, helper] = server.at(-1).params.mcpServers;
+      assert.match(relayed.url, /^http:\/\/127\.0\.0\.1:\d+\/[0-9a-f]{32}\/\d+$/);
+      assert.deepEqual({ ...relayed, url: mcpServers[0].url }, mcpServers[0]);
+      assert.deepEqual(helper, mcpServers[1]);
 
       const rawInput = { category: 'control' };
       const nested = method === 'session/resume';
