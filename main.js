@@ -14,6 +14,9 @@
  *   page -> { type: 'custom-path-request', reqId, path }   (resent until acknowledged)
  *   main -> { type: 'custom-path-ack', reqId }
  *   main -> { type: 'custom-path-result', reqId, ok, snapshot?, error?, detail? }
+ *   page -> { type: 'http-proxy-request', reqId, proxy }   (resent until acknowledged; '' clears it)
+ *   main -> { type: 'http-proxy-ack', reqId }
+ *   main -> { type: 'http-proxy-result', reqId, ok, snapshot?, error? }
  *   main -> { type: 'locale-changed' }
  *   page -> { type: 'account-request', reqId, op: 'status' | 'login' | 'cancel' | 'logout', generation? }  (resent until acknowledged)
  *     generation is the snapshot.generation the page showed when the user asked (it is clock-seeded, so it survives a main.js restart);
@@ -279,6 +282,7 @@
       path: shortString(raw.path, 1024),
       customPath: shortString(raw.customPath, 1024),
       customPathConfigured: raw.customPathConfigured === true,
+      httpProxy: shortString(raw.httpProxy, 256),
       version: shortString(raw.version, 64),
     };
     if (!result.available) {
@@ -461,6 +465,24 @@
     }, function (error) {
       customPathPending -= 1;
       throw error;
+    });
+  }
+
+  var HTTP_PROXY_ERRORS = ['invalid-proxy', 'config-invalid', 'write-failed'];
+
+  /** Saves the proxy newly started agy processes use and updates the detection result the settings pages show. */
+  function setHttpProxy(rawProxy) {
+    if (typeof rawProxy !== 'string') return Promise.resolve({ ok: false, error: 'invalid-proxy' });
+    return nodeCall('setHttpProxy', { params: { proxy: rawProxy }, timeoutMs: 10000 }).then(function (result) {
+      if (!result || result.ok !== true) {
+        return { ok: false, error: result && HTTP_PROXY_ERRORS.indexOf(result.error) !== -1 ? result.error : 'failed' };
+      }
+      // Read the usage again through the new proxy.
+      clearUsage();
+      if (!lastResult) return detect().then(function (current) { return { ok: true, snapshot: current }; });
+      lastResult = Object.assign({}, lastResult, { httpProxy: shortString(result.httpProxy, 256) });
+      if (lastResult.available) void refreshUsage();
+      return { ok: true, snapshot: snapshot() };
     });
   }
 
@@ -828,6 +850,17 @@
               }
             });
           }
+        });
+        return;
+      }
+      if (data.type === 'http-proxy-request') {
+        channel.postMessage({ type: 'http-proxy-ack', reqId: data.reqId });
+        if (!remember(data.reqId)) return;
+        setHttpProxy(data.proxy).then(function (outcome) {
+          var message = { type: 'http-proxy-result', reqId: data.reqId, ok: outcome.ok === true };
+          if (outcome.snapshot) message.snapshot = outcome.snapshot;
+          if (outcome.error) message.error = outcome.error;
+          channel.postMessage(message);
         });
         return;
       }
