@@ -122,7 +122,7 @@ if (STATE) {
   // Sign-in mode: an agent that offers Google sign-in and logout (like agy 1.5.12), keeps its sign-in
   // in FAKE_AGY_STATE and logs every ACP method it receives to FAKE_AGY_STATE + '.log'.
   const signedIn = () => fs.existsSync(STATE) && fs.readFileSync(STATE, 'utf8') === 'signed-in';
-  const TIER = { antigravity: { tier: { name: 'Google AI Pro', id: 'g1-pro-tier', upgradeUri: 'https://example.test/upgrade' } } };
+  const TIER = { antigravity: { tier: { name: process.env.FAKE_AGY_TIER || 'Google AI Pro', id: 'g1-pro-tier', upgradeUri: 'https://example.test/upgrade' } } };
   const send = (message) => process.stdout.write(JSON.stringify(Object.assign({ jsonrpc: '2.0' }, message)) + '\\n');
   const authRequired = (id) => send({ id, error: { code: -32000, message: 'Authentication required' } });
   let lines = '';
@@ -790,7 +790,7 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
     assert.equal((await call('listModels', {})).sessionId, 'fake-session');
     const opened = sent('session/new');
     const resumed = sent('session/resume');
-    assert.deepEqual(await accountStatus(), { state: 'signed-in', plan: 'Google AI Pro' });
+    assert.deepEqual(await accountStatus(), { state: 'signed-in', plan: 'Pro' });
     assert.equal(sent('session/new'), opened, 'accountStatus opened no session');
     assert.equal(sent('session/resume'), resumed + 1, 'accountStatus resumed the model-list session');
 
@@ -800,6 +800,19 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
 
     assert.deepEqual(await call('logout', {}), { ok: true });
     assert.deepEqual(await accountStatus(), { state: 'signed-out' });
+  });
+
+  test('accountStatus shortens the tier prefix case-insensitively and keeps other names intact', async (t) => {
+    for (const [tier, plan] of [['gOoGlE Ai Ultra', 'Ultra'], ['Partner Google AI Pro', 'Partner Google AI Pro']]) {
+      const fixture = makeFixture(t, { extraEnv: { FAKE_AGY_TIER: tier } });
+      fixture.env.FAKE_AGY_STATE = path.join(fixture.dir, 'agy-state');
+      fs.writeFileSync(fixture.env.FAKE_AGY_STATE, 'signed-in');
+      const worker = startWorker(fixture.env);
+      t.after(() => worker.close());
+      await worker.call({ jsonrpc: '2.0', id: 1, method: 'adoptModelSession', params: { sessionId: 'saved-session' } });
+      const { result } = await worker.call({ jsonrpc: '2.0', id: 2, method: 'accountStatus', params: { harnessId: 'agy' } });
+      assert.deepEqual(result, { state: 'signed-in', plan });
+    }
   });
 
   // Why: 0.4.x kept the model-list session only in main.js's /kv, and start-up skips the listing when a
@@ -851,7 +864,7 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
 
     const opened = sent('session/new');
     const resumed = sent('session/resume');
-    assert.deepEqual(await call('accountStatus', { harnessId: 'agy' }), { state: 'signed-in', plan: 'Google AI Pro' });
+    assert.deepEqual(await call('accountStatus', { harnessId: 'agy' }), { state: 'signed-in', plan: 'Pro' });
     assert.equal(sent('session/new'), opened, 'no agy session was opened');
     assert.equal(sent('session/resume'), resumed + 1);
     // A session the worker already remembers is kept.
@@ -2238,25 +2251,39 @@ test('usage polling returns quota and skips CLI self-update on Windows', async (
   const worker = startWorker({ ...fixture.env, FAKE_AGY_LAUNCHFILE: launchFile });
   t.after(() => worker.close());
   const { result } = await worker.call({ jsonrpc: '2.0', id: 1, method: 'usage' });
-  assert.deepEqual(result.windows, [{ label: 'Test · weekly', remainingPercent: 50, windowMinutes: 10080 }]);
+  assert.deepEqual(result.windows, [{ label: 'Test · weekly', group: 'Test', remainingPercent: 50, windowMinutes: 10080 }]);
   assert.equal(fs.readFileSync(launchFile, 'utf8'), isWin ? 'true' : 'false');
 });
 
 test('native /usage preserves exhausted groups and ignores model turns and disabled buckets', async () => {
   const { usageFromReport } = await import('../agy-usage.js');
-  const command = { name: 'usage', data: { groups: [{ name: 'Gemini', buckets: [
+  const command = { name: 'usage', data: { groups: [{ name: 'Gemini Models', buckets: [
     { window: 'weekly', remaining_fraction: 0, reset_time: '2030-01-01T00:00:00Z' },
     { window: '5h', remaining_fraction: 0.5, disabled: true },
     { window: 'unreported', remaining_fraction: null },
-  ] }, { name: 'Claude/GPT', buckets: [{ window: '5h', remaining_fraction: 1 }, { window: 'monthly', remaining_fraction: 0.25 }] }] } };
+  ] }, { name: 'Claude and GPT models', buckets: [{ window: '5h', remaining_fraction: 1 }, { window: 'monthly', remaining_fraction: 0.25 }] }] } };
   const usage = usageFromReport({ status: 'SUCCESS', num_turns: 0, command });
   // Why: Cindy ranks quota urgency by windowMinutes; a period whose length is not certain must not get one.
   assert.deepEqual(usage.windows, [
-    { label: 'Gemini · weekly', remainingPercent: 0, resetsAt: Date.UTC(2030, 0, 1), windowMinutes: 10080 },
-    { label: 'Claude/GPT · 5h', remainingPercent: 100, windowMinutes: 300 },
-    { label: 'Claude/GPT · monthly', remainingPercent: 25 },
+    { label: 'Gemini Models · weekly', group: 'Gemini Models', groupShort: 'Gemini', remainingPercent: 0, resetsAt: Date.UTC(2030, 0, 1), windowMinutes: 10080 },
+    { label: 'Claude and GPT models · 5h', group: 'Claude and GPT models', groupShort: 'Claude/GPT', remainingPercent: 100, windowMinutes: 300 },
+    { label: 'Claude and GPT models · monthly', group: 'Claude and GPT models', groupShort: 'Claude/GPT', remainingPercent: 25 },
   ]);
   assert.equal(usageFromReport({ status: 'SUCCESS', num_turns: 1, command }), null);
+});
+
+test('usage group names preserve legacy labels and respect the host length limit', async () => {
+  const { usageFromReport } = await import('../agy-usage.js');
+  for (const [name, fields] of [
+    ['  gEMini Models  ', { group: 'gEMini Models', groupShort: 'Gemini' }],
+    ['x'.repeat(60), { group: 'x'.repeat(60) }],
+    ['x'.repeat(61), {}],
+    [' ', {}],
+  ]) {
+    const groups = [{ name, buckets: [{ window: '5h', remaining_fraction: 0.5 }] }];
+    const usage = usageFromReport({ status: 'SUCCESS', num_turns: 0, command: { name: 'usage', data: { groups } } });
+    assert.deepEqual(usage.windows, [{ label: (name + ' · 5h').trim(), remainingPercent: 50, windowMinutes: 300, ...fields }]);
+  }
 });
 
 async function localRelay(t) {

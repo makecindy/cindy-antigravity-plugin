@@ -11,6 +11,11 @@ const PERIOD_UNITS = {
 };
 /** Cindy accepts window lengths up to a leap year. */
 const MAX_WINDOW_MINUTES = 527040;
+const MAX_GROUP_NAME = 60;
+const GROUP_SHORT_NAMES = new Map([
+  ['gemini models', 'Gemini'],
+  ['claude and gpt models', 'Claude/GPT'],
+]);
 
 /**
  * The length of a quota window from its period as agy reports it (`5h` → 300, `weekly` → 10080), so
@@ -33,6 +38,8 @@ function usageFromReport(report) {
   const windows = [];
   for (const group of groups) {
     if (typeof group?.name !== 'string' || !Array.isArray(group.buckets)) continue;
+    const name = group.name.trim();
+    const groupShort = GROUP_SHORT_NAMES.get(name.toLowerCase());
     for (const bucket of group.buckets) {
       const fraction = bucket?.remaining_fraction;
       if (bucket?.disabled || typeof fraction !== 'number' || !Number.isFinite(fraction) || fraction < 0 || fraction > 1) continue;
@@ -43,6 +50,8 @@ function usageFromReport(report) {
       const resetsAt = Date.parse(bucket.reset_time);
       const windowMinutes = windowMinutesOf(period);
       windows.push({ label, remainingPercent: Math.round(fraction * 10000) / 100,
+        ...(name && name.length <= MAX_GROUP_NAME ? { group: name } : {}),
+        ...(groupShort ? { groupShort } : {}),
         ...(Number.isFinite(resetsAt) && resetsAt > 0 ? { resetsAt } : {}),
         ...(windowMinutes ? { windowMinutes } : {}) });
       if (windows.length === 24) break;

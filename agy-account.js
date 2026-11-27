@@ -107,7 +107,7 @@ async function accountStatus(params, options) {
   if (!current.signedIn) return { state: 'signed-out' };
   const name = current.tier && current.tier.name;
   const plan = typeof name === 'string' && !/[\u0000-\u001f\u007f-\u009f]/.test(name)
-    ? name.slice(0, MAX_PLAN).trim()
+    ? name.replace(/^Google AI /i, '').slice(0, MAX_PLAN).trim()
     : '';
   return { state: 'signed-in', ...(plan ? { plan } : {}) };
 }
