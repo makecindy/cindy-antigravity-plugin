@@ -126,6 +126,7 @@ agy --settings {"useG1Credits":false} acp --disable-telemetry
 | `agy-models.js` | 经 ACP 读取模型、每个模型的思考深度、agy 的工作模式与订阅档位 |
 | `agy-account.js` | 经 ACP 查询登录状态、用 Google 登录、取消登录、退出登录 |
 | `agy-acp.js` | ACP 引擎入口：启动 `agy acp`，双向转发 ACP，支持插话时转换请求 |
+| `agy-account-errors.js` | 识别 Antigravity 的额度用尽（含 `⚠ ... Resets in ...` 提示）、登录失效与容量过载，补上 `error.data._meta.cindy` |
 | `remote-workspace.js` | 任务文件在另一台电脑时：受限 Agent 的定义、两段式启动，以及读懂 ACP 的转接 |
 | `settings.html` / `settings.js` | 设置页：检测结果、版本、位置、自定义路径、安装提示、账号（登录 / 退出）与「重新检测」 |
 | `locales/` | 清单名称与说明的英文、简体中文文案 |
