@@ -109,9 +109,12 @@ Cindy 新增的账号都是账号列表里的普通一行，按同一套策略�
 - **没有退出登录**：在 Cindy 里移除账号只是让 Cindy 不再使用它，登录和历史保留。要让 agy 原有的登录真正登出，请在终端的
   `agy` 里操作。
 
-登录信息由 agy 保存在它自己的存储里（原有登录在系统凭据存储，新增账号在各自的账号目录），Cindy 不保存。agy 1.5.18 的 ACP
-与 `/usage` 只给订阅档位、不给账号身份，所以新增账号的邮箱取自该账号目录里 agy 自己写的凭据文件：只取邮箱、显示名、
-档位和一个摘要，不返回、不记录令牌。原有登录的凭据在系统凭据存储里，插件不读，所以它只显示订阅档位。
+登录信息由 agy 保存在它自己的存储里（原有登录在系统凭据存储，新增账号在各自的账号目录），Cindy 不保存，插件也不打开
+agy 的凭据文件。agy 1.5.18 的 ACP 与 `/usage` 只给订阅档位、不给账号身份，但它自己的日志会写明当前登录的邮箱
+（`OAuth: authenticated successfully as …`，日志里没有令牌）。所以检查登录状态时，插件让 agy 把这一次的日志写到一个私有的
+临时文件（`--log-file`），从中读出邮箱后立即删除。原有登录和新增账号用的是同一种办法，账号列表里每一行都显示实际的账号；
+同一个 Google 账号既是原有登录、又被添加为新增账号时，两者的摘要相同，Cindy 能识别出来。日志格式若在以后的 agy 版本里变化，
+读不到邮箱的账号只显示订阅档位，不会显示成别的账号。
 
 支持引擎账号的 Cindy 可以在「设置 → 模型供应商 → Antigravity」中像 Claude Code / Codex 一样管理并添加多个
 Google 账号，按账号池策略混用（最少占用、轮询、按顺序、按权重、余量最多）、限制并发、暂停、拆出为单独供应商，并在
@@ -125,9 +128,9 @@ Google 账号，按账号池策略混用（最少占用、轮询、按顺序、�
   会话历史完全隔离在账号目录内；查询该账号 `/usage` 时以该目录为 `HOME`（Windows 同步设置 `USERPROFILE`）读取同一份
   凭据。账号目录不存在或不可写时直接以非零状态退出（退出码 77），绝不回落到默认登录。远程工作区和分享模式同样按该
   账号目录运行。
-- **身份与去重**：新增账号的 `accountStatus` 从账号目录内 agy 写入的凭据元数据读取非敏感的邮箱（`identity.email`）与
-  稳定摘要（`fingerprint`，由邮箱或 sub 哈希得到，不含任何令牌），供 Cindy 显示账号邮箱并在重复登录同一 Google 账号时
-  只计一次调度；套餐名称来自 ACP 订阅档位或凭据元数据。
+- **身份与去重**：`accountStatus` 从 agy 本次检查的日志里读取邮箱（`identity.email`），并给出由邮箱哈希得到的
+  稳定摘要（`fingerprint`，不含任何令牌），供 Cindy 显示账号邮箱并在重复登录同一 Google 账号时只计一次调度；原有登录
+  与新增账号一视同仁。套餐名称来自 ACP 订阅档位。
 - **自动换号分类**：入口在 `session/new`、`session/load`、`session/resume`、`session/prompt` 失败回包里，把明确的
   登录失效、额度耗尽（含未来重置时间，如有）与模型容量不足/限流标成 `error.data._meta.cindy`
   （`auth-required` / `usage-limit` / `overloaded`），供 Cindy 冷却并切换到池内其他可用账号。
@@ -138,11 +141,11 @@ Google 账号，按账号池策略混用（最少占用、轮询、按顺序、�
 | `main.js` | 逻辑页：检测 agy、读取模型与模式，`PUT /harnesses` 发布可用状态与账号登录方式 |
 | `worker.js` | Node 工作进程（json-rpc-stdio），提供 `detect`、`setCustomPath`、`listModels`、`account`、`accountStatus`、`accountLogin`、`accountLoginCancel`、`login`、`cancelLogin`、`logout`、`usage` |
 | `resolve-agy.js` | 查找与启动 agy 的共用代码（worker 与 ACP 入口用同一套自定义路径、查找顺序、参数与账号目录环境） |
-| `agy-account-dir.js` | Cindy 新增账号目录的校验、路径布局（`.gemini/antigravity-cli`）与非敏感身份元数据读取 |
+| `agy-account-dir.js` | Cindy 新增账号目录的校验与路径布局（`.gemini/antigravity-cli`） |
 | `agy-account-errors.js` | 为因账号/额度/繁忙失败的 ACP 会话与轮次回包补上 `error.data._meta.cindy` |
 | `agy-client.js` | 插件自用的短时 ACP 连接（启动 agy、`initialize`、调用、停止） |
 | `agy-models.js` | 经 ACP 读取模型、每个模型的思考深度、agy 的工作模式与订阅档位 |
-| `agy-account.js` | 经 ACP 查询登录状态、用 Google 登录、取消登录（支持原有登录与独立账号目录） |
+| `agy-account.js` | 经 ACP 查询登录状态、从 agy 的日志读出账号邮箱、用 Google 登录、取消登录（支持原有登录与独立账号目录） |
 | `agy-acp.js` | ACP 引擎入口：处理 `--cindy-account-dir`、启动 `agy acp`，双向转发 ACP，支持插话与错误分类 |
 | `remote-workspace.js` | 任务文件在另一台电脑时：受限 Agent 的定义、两段式启动、账号目录透传，以及读懂 ACP 的转接 |
 | `settings.html` / `settings.js` | 设置页：检测结果、版本、位置、自定义路径、安装提示、到模型供应商管理账号的引导与「重新检测」 |
@@ -187,8 +190,6 @@ node --test test/bridge.test.mjs
 
 - macOS / Linux 上 agy 的默认安装位置未实机验证；不在上述位置时，可以在插件设置页配置自定义 `agy` 路径，或把 `agy` 所在目录加进 PATH。
 - 未登录在读取模型（Cindy 启动、打开模型选择器）或打开设置页时发现；在终端里登出后，Cindy 要到下次检查才知道。
-- agy 原有的登录没有账号身份（agy 不提供，它的凭据在系统凭据存储里，插件不读）：账号列表里它只显示订阅档位；同一个 Google 账号既是原有登录、
-  又被添加为新增账号时，Cindy 识别不出两者是同一个账号，会各自分配任务但共用同一份额度。遇到这种情况请在 Cindy 里移除其中一个。
 - 只提供 Google 个人账号登录；agy 公布的 Gemini Enterprise、Gemini API Key（按量计费）、Agent Platform 登录方式没有接入。
 - agy 在任务中自己切换模式时（例如规划结束后），Cindy 的权限菜单不会跟着变。
 - Cindy 给插件 Node 进程的环境变量是精简过的，只写在 shell 配置里的代理等变量不会传给 agy。
