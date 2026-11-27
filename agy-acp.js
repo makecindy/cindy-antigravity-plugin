@@ -21,6 +21,7 @@
 
 const os = require('node:os');
 const { attachSteering } = require('./agy-steering.js');
+const { recordUsageActivity } = require('./agy-usage.js');
 const { ACP_ARGS, detectAgy, readCustomAgyConfig, resolveAgy, spawnAgy, killTree } = require('./resolve-agy.js');
 const remoteWorkspace = require('./remote-workspace.js');
 
@@ -70,6 +71,11 @@ function run(agyPath) {
   let finished = false;
   let stopCode = null;
   let forceTimer = null;
+  let hadActivity = false;
+  const noteActivity = () => {
+    hadActivity = true;
+    recordUsageActivity();
+  };
 
   const finish = (code) => {
     if (finished) return;
@@ -120,6 +126,7 @@ function run(agyPath) {
 
   child.on('exit', (code, signal) => {
     childExited = true;
+    if (hadActivity) recordUsageActivity();
     const status = stopCode !== null ? stopCode : exitCodeFor(code, signal);
     // Let the remaining stdout bytes reach Cindy, but don't wait forever for pipes
     // that a grandchild may still hold open.
@@ -130,7 +137,7 @@ function run(agyPath) {
     });
   });
 
-  const { detach: detachSteering, relay: stdoutRelay } = attachSteering(process.stdin, process.stdout, child, () => stop('SIGTERM'));
+  const { detach: detachSteering, relay: stdoutRelay } = attachSteering(process.stdin, process.stdout, child, () => stop('SIGTERM'), { onActivity: noteActivity });
   child.stdin.on('error', () => {
     // EPIPE after agy exited; the exit handler takes care of shutting down.
   });
@@ -209,6 +216,7 @@ async function runRemoteWorkspace() {
     describe,
     exitCodeFor,
     notFoundExitCode: NOT_FOUND_EXIT_CODE,
+    onActivity: () => recordUsageActivity(),
     timings: { stdinEndGrace: STDIN_END_GRACE_MS, signalGrace: SIGNAL_GRACE_MS, flush: FLUSH_TIMEOUT_MS },
   });
 }

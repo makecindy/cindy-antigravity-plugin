@@ -231,6 +231,18 @@ const NEWLINE = Buffer.from('\n');
  */
 function startRemoteWorkspace(agyPath, host) {
   const { acpArgs, spawnAgy, killTree, exitAfterStderr, describe, exitCodeFor, timings } = host;
+  const nowFn = typeof host.now === 'function' ? host.now : Date.now;
+  const activityHeartbeatMs = typeof host.activityHeartbeatMs === 'number' && host.activityHeartbeatMs >= 0
+    ? host.activityHeartbeatMs
+    : 60_000;
+  let lastActivityNotifiedAt = 0;
+  const notifyActivity = typeof host.onActivity === 'function'
+    ? () => { lastActivityNotifiedAt = nowFn(); try { host.onActivity(); } catch { /* ignore */ } }
+    : null;
+  const notifyProgressIfDue = () => {
+    if (!notifyActivity || activePrompts.size === 0) return;
+    if (nowFn() - lastActivityNotifiedAt >= activityHeartbeatMs) notifyActivity();
+  };
   let dir;
   try {
     dir = prepareLaunchDir();
@@ -252,7 +264,15 @@ function startRemoteWorkspace(agyPath, host) {
   let stdinEnded = false;
   const queued = [];
   const seenCalls = new Map();
+  const activePrompts = new Set();
+  let hadPrompt = false;
   let serverNames = [];
+  const notePromptMessage = (message) => {
+    if (!message || (message.method !== 'session/prompt' && message.method !== '_session/steering')) return;
+    hadPrompt = true;
+    if (message.method === 'session/prompt' && message.id !== undefined) activePrompts.add(message.id);
+    if (notifyActivity) notifyActivity();
+  };
 
   const running = (child) => Boolean(child) && child.exitCode === null && child.signalCode === null;
 
@@ -409,6 +429,7 @@ function startRemoteWorkspace(agyPath, host) {
     });
     current.on('exit', (code, signal) => {
       agentExited = true;
+      if (hadPrompt && notifyActivity) notifyActivity();
       const status = stopCode !== null ? stopCode : exitCodeFor(code, signal);
       const closeTimer = setTimeout(() => finish(status), timings.flush);
       current.once('close', () => {
@@ -437,6 +458,12 @@ function startRemoteWorkspace(agyPath, host) {
       phase = 'session';
       for (const pending of queued.splice(0)) toAgentLine(pending);
       return;
+    }
+    if (message.id !== undefined && message.method === undefined && activePrompts.delete(message.id)) {
+      if (notifyActivity) notifyActivity();
+    }
+    if (message.method === 'session/update' || message.method === 'session/request_permission') {
+      notifyProgressIfDue();
     }
     const params = isObject(message.params) ? message.params : null;
     const isPermission = message.method === 'session/request_permission' && message.id !== undefined;
@@ -476,10 +503,12 @@ function startRemoteWorkspace(agyPath, host) {
       return;
     }
     if (phase === 'session') {
+      notePromptMessage(message);
       toAgentLine(line);
       return;
     }
     if (phase === 'opening') {
+      notePromptMessage(message);
       queued.push(line);
       return;
     }
