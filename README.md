@@ -187,6 +187,8 @@ node --test test/bridge.test.mjs
 
 - macOS / Linux 上 agy 的默认安装位置未实机验证；不在上述位置时，可以在插件设置页配置自定义 `agy` 路径，或把 `agy` 所在目录加进 PATH。
 - 未登录在读取模型（Cindy 启动、打开模型选择器）或打开设置页时发现；在终端里登出后，Cindy 要到下次检查才知道。
+- agy 原有的登录没有账号身份（agy 不提供，它的凭据在系统凭据存储里，插件不读）：账号列表里它只显示订阅档位；同一个 Google 账号既是原有登录、
+  又被添加为新增账号时，Cindy 识别不出两者是同一个账号，会各自分配任务但共用同一份额度。遇到这种情况请在 Cindy 里移除其中一个。
 - 只提供 Google 个人账号登录；agy 公布的 Gemini Enterprise、Gemini API Key（按量计费）、Agent Platform 登录方式没有接入。
 - agy 在任务中自己切换模式时（例如规划结束后），Cindy 的权限菜单不会跟着变。
 - Cindy 给插件 Node 进程的环境变量是精简过的，只写在 shell 配置里的代理等变量不会传给 agy。
