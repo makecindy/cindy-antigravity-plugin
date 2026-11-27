@@ -41,7 +41,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { completeInitializeResult, isObject, isSessionOpen, normalizeMcpToolCall } = require('./agy-mcp.js');
-const { warmMcpServers } = require('./mcp-warmup.js');
+const { CLOSE_BUDGET_MS, warmMcpServers } = require('./mcp-warmup.js');
 
 const REMOTE_WORKSPACE_ARG = '--cindy-remote-workspace';
 const GUEST_WORKSPACE_ARG = '--cindy-guest-workspace';
@@ -56,8 +56,11 @@ const MAX_SERVERS = 64;
 /** Remote-workspace mode could not be established, or was broken by the agent; agy is not left running. */
 const REMOTE_WORKSPACE_EXIT_CODE = 78;
 const LAUNCH_DIR_PREFIX = 'cindy-agy-remote-';
-/** How long ending the task waits for the warmed MCP sessions agy did not take over to be ended. */
-const WARMUP_CLOSE_GRACE_MS = 1_500;
+/**
+ * How long ending the task waits for the warmed MCP sessions agy did not take over to be ended: the
+ * whole budget of the warm-up's close(). Cindy ends anything left when the remote run ends.
+ */
+const WARMUP_CLOSE_GRACE_MS = CLOSE_BUDGET_MS + 250;
 /** A launch directory this old belongs to a task that ended without cleaning up (a crash, a hard kill). */
 const STALE_LAUNCH_DIR_MS = 24 * 60 * 60 * 1000;
 
