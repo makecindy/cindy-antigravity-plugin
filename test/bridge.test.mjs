@@ -17,6 +17,9 @@ import vm from 'node:vm';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const isWin = process.platform === 'win32';
+// The plugin has no sign-in of its own: Cindy's engine accounts call `accountLogin`, here for agy's original login.
+const SIGN_IN = { method: 'accountLogin', params: { harnessId: 'agy', methodId: 'oauth-personal' } };
+const CANCEL_SIGN_IN = { method: 'accountLoginCancel', params: { harnessId: 'agy' } };
 
 const RESULT_JSON =
   '{"protocolVersion":1,"agentCapabilities":{"loadSession":false,"promptCapabilities":{"image":false}},' +
@@ -107,8 +110,11 @@ if (JSON.stringify(args) === REMOTE_ARGS) {
   process.stdin.on('end', () => process.stdout.write('', () => process.exit(0)));
   return;
 }
-// Every launch must pass the constant ACP args (including no paid credits and no telemetry).
-if (JSON.stringify(args) !== ${JSON.stringify(JSON.stringify(EXPECTED_ACP_ARGS))}) {
+// Every launch must pass the constant ACP args (including no paid credits and no telemetry). The
+// plugin's own sign-in check may add \`--log-file <file>\` after them, never anything else.
+const logFileAt = args.indexOf('--log-file');
+const acpArgs = logFileAt !== -1 && logFileAt === args.length - 2 ? args.slice(0, logFileAt) : args;
+if (JSON.stringify(acpArgs) !== ${JSON.stringify(JSON.stringify(EXPECTED_ACP_ARGS))}) {
   process.stderr.write('fake-agy: unexpected arguments ' + JSON.stringify(args) + '\\n');
   process.exit(2);
 }
@@ -712,10 +718,11 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
     const calls = (method) => nodeCalls.filter((call) => call.method === method);
     vm.runInContext(fs.readFileSync(path.join(root, 'main.js'), 'utf8'), context, { filename: 'main.js' });
 
-    // Start-up: agy is installed but refuses a session: unavailable with the sign-in hint.
-    await waitFor(() => puts.some((body) => body.harnesses[0].reason === 'not-signed-in'), 3_000, 'sign-in hint');
-    assert.deepEqual(puts.at(-1), { harnesses: [{ id: 'agy', available: false, reason: 'not-signed-in', version: '1.5.12',
-      message: 'Antigravity is not signed in. Open the Antigravity plugin settings and select Sign in with Google.' }] });
+    // Start-up: agy is installed; default login is signed out so the settings page sees signInRequired,
+    // while the engine stays available with its Google sign-in method so Cindy's account pool can sign in or add accounts.
+    await waitFor(() => puts.length >= 1, 3_000, 'initial publish');
+    assert.deepEqual(puts.at(-1), { harnesses: [{ id: 'agy', available: true, reportsUsage: true,
+      accounts: { methods: [{ id: 'oauth-personal', label: 'Google account', kind: 'browser' }] }, version: '1.5.12' }] });
 
     // Signed in, then "Check again": listed right away (no one-minute wait) and published with the modes.
     signedIn = true;
@@ -724,8 +731,8 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
     page.onmessage = (event) => received.push(event.data);
     page.postMessage({ type: 'detect-request', reqId: 'r1' });
     await waitFor(() => puts.some((body) => body.harnesses[0].modes), 3_000, 'models and modes published');
-    // Cindy may show agy's one login, but is never offered a way to add another (methods: []).
-    assert.deepEqual(puts.at(-1), { harnesses: [{ id: 'agy', available: true, reportsUsage: true, accounts: { methods: [] }, version: '1.5.12',
+    assert.deepEqual(puts.at(-1), { harnesses: [{ id: 'agy', available: true, reportsUsage: true,
+      accounts: { methods: [{ id: 'oauth-personal', label: 'Google account', kind: 'browser' }] }, version: '1.5.12',
       models: [{ id: 'gemini-4-neon', name: 'Gemini 4 Neon', efforts: ['low', 'medium', 'high', 'xhigh'], defaultEffort: 'high' }],
       modes: ['default', 'acceptEdits', 'auto', 'plan'], defaultMode: 'default' }] });
     assert.equal(calls('listModels').length, 2);
@@ -735,24 +742,25 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
     await waitFor(() => received.some((m) => m.type === 'detect-result' && m.snapshot.signInRequired === false), 3_000, 'updated snapshot');
   });
 
-  // 2026-11-19 实测 agy 1.5.12:ACP 的 authenticate(oauth-personal)由 agy 打开浏览器登录；logout 一调用就登出。
-  test('the worker signs agy in and out over ACP and reports only the sign-in and the tier', async (t) => {
+  // Accounts are managed in Cindy's Model Providers: the worker signs agy in for Cindy's engine accounts
+  // and offers the settings page no sign-in, status or sign-out of its own.
+  test('the worker signs agy in only for Cindy’s engine accounts and has no sign-out', async (t) => {
     const fixture = makeFixture(t);
     const state = path.join(fixture.dir, 'agy-state');
     fixture.env.FAKE_AGY_STATE = state;
     const worker = startWorker(fixture.env);
-    const call = async (id, method, params) => (await worker.call({ jsonrpc: '2.0', id, method, params })).result;
-    const capabilities = { canSignIn: true, canSignOut: true };
-    assert.deepEqual(await call(1, 'account', {}), { supported: true, ...capabilities, signedIn: false });
-    assert.deepEqual(await call(2, 'login', {}), { ok: true, tier: { name: 'Google AI Pro' } });
-    assert.deepEqual(await call(3, 'account', { sessionId: 'probe-1' }),
-      { supported: true, ...capabilities, signedIn: true, tier: { name: 'Google AI Pro' } });
-    assert.deepEqual(await call(4, 'logout', {}), { ok: true });
-    assert.deepEqual(await call(5, 'account', {}), { supported: true, ...capabilities, signedIn: false });
+    t.after(() => worker.close());
+    let id = 0;
+    const call = (method, params) => worker.call({ jsonrpc: '2.0', id: ++id, method, params });
+    assert.deepEqual((await call('accountStatus', { harnessId: 'agy' })).result, { state: 'signed-out' });
+    assert.deepEqual((await call(SIGN_IN.method, SIGN_IN.params)).result, { ok: true });
+    assert.deepEqual((await call('accountStatus', { harnessId: 'agy' })).result, { state: 'signed-in', plan: 'Google AI Pro' });
+    for (const method of ['account', 'login', 'cancelLogin', 'logout']) {
+      assert.equal((await call(method, {})).error.code, -32601, `${method} is not a worker method`);
+    }
     const sent = fs.readFileSync(state + '.log', 'utf8').trim().split('\n');
-    assert.deepEqual(sent.filter((method) => method.startsWith('authenticate') || method === 'logout'),
-      ['authenticate:oauth-personal', 'logout']);
-    await worker.close();
+    assert.deepEqual(sent.filter((method) => method.startsWith('authenticate') || method === 'logout'), ['authenticate:oauth-personal']);
+    assert.equal(fs.readFileSync(state, 'utf8'), 'signed-in');
   });
 
   test('cancelling a sign-in stops agy and reports it as cancelled', async (t) => {
@@ -760,11 +768,11 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
     const state = path.join(fixture.dir, 'agy-state');
     fixture.env.FAKE_AGY_STATE = state;
     const worker = startWorker(fixture.env);
-    const login = worker.call({ jsonrpc: '2.0', id: 1, method: 'login' });
+    const login = worker.call({ jsonrpc: '2.0', id: 1, ...SIGN_IN });
     await waitFor(() => fs.existsSync(state + '.log') && fs.readFileSync(state + '.log', 'utf8').includes('authenticate'),
       5_000, 'sign-in sent to agy');
     const agyPid = readPid(fixture.pidFile);
-    assert.deepEqual((await worker.call({ jsonrpc: '2.0', id: 2, method: 'cancelLogin' })).result, { ok: true, cancelled: true });
+    assert.deepEqual((await worker.call({ jsonrpc: '2.0', id: 2, ...CANCEL_SIGN_IN })).result, { ok: true });
     assert.deepEqual((await login).result, { ok: false, error: 'cancelled' });
     await waitFor(() => !isAlive(agyPid), 5_000, 'agy stopped');
     await worker.close();
@@ -784,9 +792,9 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
     const sent = (method) => fs.readFileSync(state + '.log', 'utf8').trim().split('\n').filter((line) => line === method).length;
 
     assert.deepEqual(await accountStatus(), { state: 'signed-out' });
-    assert.equal((await call('login', {})).ok, true);
-    // Signed in before any model listing: there is no session to read the tier from, so no plan.
-    assert.deepEqual(await accountStatus(), { state: 'signed-in' });
+    assert.equal((await call(SIGN_IN.method, SIGN_IN.params)).ok, true);
+    // Right after sign-in, the worker already remembers the tier from authenticate even before listing models.
+    assert.deepEqual(await accountStatus(), { state: 'signed-in', plan: 'Google AI Pro' });
     assert.equal((await call('listModels', {})).sessionId, 'fake-session');
     const opened = sent('session/new');
     const resumed = sent('session/resume');
@@ -794,11 +802,12 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
     assert.equal(sent('session/new'), opened, 'accountStatus opened no session');
     assert.equal(sent('session/resume'), resumed + 1, 'accountStatus resumed the model-list session');
 
-    // Cindy can never add an Antigravity account: an account directory or another engine has no status.
-    assert.equal(await accountStatus({ harnessId: 'agy', accountDir: path.join(fixture.dir, 'account-1') }), null);
+    // A missing account directory or another engine id has no status.
+    assert.equal(await accountStatus({ harnessId: 'agy', accountDir: path.join(fixture.dir, 'missing-account') }), null);
     assert.equal(await accountStatus({ harnessId: 'other' }), null);
 
-    assert.deepEqual(await call('logout', {}), { ok: true });
+    // Signed out elsewhere (agy in a terminal): the next read says so.
+    fs.rmSync(state);
     assert.deepEqual(await accountStatus(), { state: 'signed-out' });
   });
 
@@ -873,92 +882,10 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
     const worker = startWorker(crashing.env);
     t.after(() => worker.close());
     assert.equal((await worker.call(request)).result, null);
-    // The settings page still sees the failure itself.
-    assert.equal((await worker.call({ jsonrpc: '2.0', id: 2, method: 'account', params: {} })).result.error, 'status-failed');
-  });
-
-  // 登录前就开始读取模型时，它晚于登录返回的「未登录」不能把引擎改回未登录。
-  test('main.js signs in and out for the settings page and keeps Cindy’s engine status in step', async () => {
-    class Channel {
-      static all = [];
-      constructor(name) {
-        this.name = name;
-        this.onmessage = null;
-        Channel.all.push(this);
-      }
-      postMessage(data) {
-        const copy = JSON.parse(JSON.stringify(data));
-        for (const other of Channel.all) {
-          if (other !== this && other.name === this.name && other.onmessage) setTimeout(() => other.onmessage({ data: copy }), 0);
-        }
-      }
-    }
-    const nodeCalls = [];
-    const puts = [];
-    let finishFirstListing = null;
-    const context = vm.createContext({
-      BroadcastChannel: Channel,
-      setTimeout,
-      clearTimeout,
-      cindy: {
-        request: async () => ({ ok: true, context: { locale: 'zh-CN', uiLocale: 'zh-CN' } }),
-        node: {
-          request: async (request) => {
-            nodeCalls.push(JSON.parse(JSON.stringify(request)));
-            if (request.method === 'detect') return { ok: true, result: { available: true, version: '1.5.12' } };
-            if (request.method === 'listModels' && !finishFirstListing) {
-              // The start-up listing began while agy was signed out and answers only after the sign-in.
-              return new Promise((resolve) => {
-                finishFirstListing = () => resolve({ ok: true, result: { supported: false, reason: 'not-signed-in' } });
-              });
-            }
-            if (request.method === 'listModels') {
-              return { ok: true, result: { supported: true, sessionId: 'probe-1', tier: { name: 'Google AI Pro' },
-                models: [{ id: 'gemini-4-neon', name: 'Gemini 4 Neon' }] } };
-            }
-            if (request.method === 'login') return { ok: true, result: { ok: true, tier: { name: 'Google AI Pro' } } };
-            if (request.method === 'logout') return { ok: true, result: { ok: true } };
-            return { ok: false };
-          },
-        },
-        onHostMessage: () => () => {},
-      },
-      fetch: async (url, init) => {
-        if (url === '/kv' && !init) return { ok: true, json: async () => ({}) };
-        if (url === '/harnesses') puts.push(JSON.parse(init.body).harnesses[0]);
-        return { ok: true, status: 204 };
-      },
-    });
-    const calls = (method) => nodeCalls.filter((call) => call.method === method);
-    vm.runInContext(fs.readFileSync(path.join(root, 'main.js'), 'utf8'), context, { filename: 'main.js' });
-    await waitFor(() => finishFirstListing, 3_000, 'start-up listing');
-
-    const page = new Channel('agy-acp');
-    const received = [];
-    page.onmessage = (event) => received.push(event.data);
-    const result = (reqId) => received.find((m) => m.type === 'account-result' && m.reqId === reqId);
-    page.postMessage({ type: 'account-request', reqId: 'a1', op: 'login' });
-    page.postMessage({ type: 'account-request', reqId: 'a1', op: 'login' }); // resent before the ack
-    await waitFor(() => result('a1'), 3_000, 'sign-in result');
-    assert.deepEqual(calls('login'), [{ method: 'login', params: {}, timeoutMs: 30_000, maxTotalMs: 330_000 }]);
-    assert.deepEqual(result('a1').account, { signedIn: true, tier: 'Google AI Pro', canSignIn: true, canSignOut: true, busy: null });
-
-    finishFirstListing();
-    await waitFor(() => puts.length && puts.at(-1).models, 3_000, 'models read again after the sign-in');
-    assert.ok(puts.every((entry) => entry.available), 'the late listing never marks the engine signed out');
-    assert.deepEqual(puts.at(-1), { id: 'agy', available: true, reportsUsage: true, accounts: { methods: [] }, version: '1.5.12',
-      models: [{ id: 'gemini-4-neon', name: 'Gemini 4 Neon' }] });
-
-    page.postMessage({ type: 'account-request', reqId: 'a2', op: 'logout' });
-    await waitFor(() => result('a2'), 3_000, 'sign-out result');
-    assert.equal(calls('logout').length, 1);
-    assert.equal(result('a2').account.signedIn, false);
-    assert.deepEqual(puts.at(-1), { id: 'agy', available: false, reason: 'not-signed-in', version: '1.5.12',
-      message: 'Antigravity 还没有登录。请打开 Antigravity 插件设置，点「用 Google 登录」。' });
   });
 
   // agy 的 logout 一调用就登出(2026-11-19 实测)：设置页只在用户确认后才发出退出请求。
-  test('the settings page resumes a CLI update after reopening and confirms sign-out', async () => {
+  test('the settings page points to Model Providers for accounts and resumes a CLI update after reopening', async () => {
     class Channel {
       static all = [];
       constructor(name) {
@@ -980,6 +907,7 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
         }
       }
     }
+    const openProviders = { offered: true, refuse: false, posts: [] };
     const elements = new Map();
     const element = (id) => {
       if (!elements.has(id)) {
@@ -995,8 +923,17 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
     const context = vm.createContext({
       BroadcastChannel: Channel, crypto: globalThis.crypto, setTimeout, clearTimeout, setInterval, clearInterval,
       document: { getElementById: element, documentElement: {}, visibilityState: 'visible', addEventListener() {} },
-      fetch: async (url) => ({ ok: true,
-        json: async () => (url === '/app-context' ? { context: { uiLocale: 'zh-CN' } } : { state: 'on' }) }),
+      fetch: async (url, init) => {
+        // Cindy's "show this engine in Model Providers": POST only, so a GET answers 405 where it exists.
+        if (url === '/harnesses/open-settings') {
+          if (!openProviders.offered) return { ok: false, status: 404 };
+          if (!init || init.method !== 'POST') return { ok: false, status: 405 };
+          openProviders.posts.push(init.body);
+          return openProviders.refuse ? { ok: false, status: 403 } : { ok: true, status: 200 };
+        }
+        return { ok: true, status: 200,
+          json: async () => (url === '/app-context' ? { context: { uiLocale: 'zh-CN' } } : { state: 'on' }) };
+      },
     });
     // Stands in for main.js: agy is installed and signed in.
     const main = new Channel('agy-acp');
@@ -1005,12 +942,12 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
     let version = '1.5.11';
     let maintenanceState = { type: 'cli-state' };
     let finishUpdate;
-    const account = { signedIn: true, tier: 'Google AI Pro', canSignIn: true, canSignOut: true, busy: null };
+    let signInRequired = false;
     main.onmessage = ({ data }) => {
       if (data.type === 'detect-request') {
         main.postMessage({ type: 'detect-ack', reqId: data.reqId });
-        main.postMessage({ type: 'detect-result', reqId: data.reqId, snapshot: { ok: true, account,
-          result: { available: true, version }, signInRequired: false, publish: { status: 'published' }, checkedAt: 1 } });
+        main.postMessage({ type: 'detect-result', reqId: data.reqId, snapshot: { ok: true,
+          result: { available: true, version }, signInRequired, publish: { status: 'published' }, checkedAt: 1 } });
       }
       if (data.type === 'cli-state-request') main.postMessage(maintenanceState);
       if (data.type === 'cli-maintenance') {
@@ -1028,30 +965,40 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
         }
         main.postMessage(maintenanceState);
       }
-      if (data.type === 'account-request') {
-        requests.push(data.op);
-        main.postMessage({ type: 'account-ack', reqId: data.reqId });
-        main.postMessage({ type: 'account-result', reqId: data.reqId, op: data.op, account });
-      }
+      if (data.type === 'account-request') requests.push(data.op);
     };
     context.window = context;
     vm.runInContext(fs.readFileSync(path.join(root, 'cli-settings.js'), 'utf8'), context, { filename: 'cli-settings.js' });
     const openSettings = () => vm.runInContext(fs.readFileSync(path.join(root, 'settings.js'), 'utf8'), context, { filename: 'settings.js' });
     openSettings();
 
-    await waitFor(() => element('account-status').textContent === '已登录 · Google AI Pro', 3_000, 'signed-in status');
-    assert.equal(element('badge').textContent, '可以使用');
-    assert.equal(element('account-logout').hidden, false);
-    assert.equal(element('account-login').hidden, true);
-    // After each detection the page also asks once whether agy is signed in.
-    await waitFor(() => requests.length > 0, 3_000, 'sign-in check after detection');
-    assert.deepEqual(requests, ['status']);
-    element('account-logout').click();
-    assert.equal(element('account-confirm').hidden, false);
+    // Accounts are managed in Cindy's Model Providers: the page points there and asks main.js nothing about them.
+    await waitFor(() => element('badge').textContent === '可以使用', 3_000, 'detection shown');
+    assert.equal(element('accounts-guide').hidden, false);
+    assert.equal(element('accounts-guide-title').textContent, '账号');
+    assert.match(element('accounts-guide-text').textContent, /设置 → 模型供应商 → Antigravity/);
+    assert.equal(element('accounts-guide-text').attributes['data-tone'], 'neutral');
     await new Promise((resolve) => setTimeout(resolve, 50));
-    assert.deepEqual(requests, ['status'], 'choosing Sign out only asks for confirmation');
-    element('account-confirm-yes').click();
-    await waitFor(() => requests.includes('logout'), 3_000, 'sign-out request after confirming');
+    assert.deepEqual(requests, [], 'the page sends no account request');
+    for (const id of ['account', 'account-login', 'account-logout', 'account-confirm-yes', 'harness-usage']) {
+      assert.equal(elements.has(id), false, `the page has no ${id}`);
+    }
+    // The button opens Antigravity in Cindy's Model Providers where Cindy offers that, naming this plugin's own engine.
+    await waitFor(() => element('accounts-open').hidden === false, 3_000, 'manage button offered');
+    assert.equal(element('accounts-open').textContent, '在模型供应商里管理');
+    assert.equal(element('accounts-open-note').hidden, true);
+    element('accounts-open').click();
+    await waitFor(() => openProviders.posts.length === 1, 3_000, 'open request sent');
+    assert.deepEqual(JSON.parse(openProviders.posts[0]), { id: 'agy' });
+    assert.equal(element('accounts-open-note').hidden, true);
+    // Cindy did not open it (for example the click was already used): the text path stays as the way there.
+    openProviders.refuse = true;
+    element('accounts-open').click();
+    await waitFor(() => element('accounts-open-note').hidden === false, 3_000, 'fallback note');
+    assert.match(element('accounts-open-note').textContent, /没能直接打开/);
+    openProviders.refuse = false;
+    element('accounts-open').click();
+    await waitFor(() => element('accounts-open-note').hidden === true, 3_000, 'note cleared after it opened');
 
     await waitFor(() => element('cli-action').textContent === '更新到 1.5.12', 3_000, 'automatic update check');
     assert.deepEqual(maintenance.map(item => item.action), ['check']);
@@ -1074,6 +1021,24 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
     assert.equal(element('cli-action').hidden, true);
     assert.deepEqual(maintenance.map(item => item.action), ['check', 'check', 'update']);
     assert.equal(maintenance[2].version, '1.5.12');
+
+    // No signed-in account could list the models: the badge says so and the guide asks to add one in Cindy.
+    signInRequired = true;
+    element('recheck').click();
+    await waitFor(() => element('badge').textContent === '未登录', 3_000, 'not signed in');
+    assert.equal(element('badge').attributes['data-tone'], 'warning');
+    assert.match(element('accounts-guide-text').textContent, /还没有已登录的账号.*模型供应商/);
+    assert.equal(element('accounts-guide-text').attributes['data-tone'], 'warning');
+
+    // An older Cindy, a phone or a remote view has no such path: no button, only the text.
+    openProviders.offered = false;
+    Channel.all = [main];
+    elements.clear();
+    openSettings();
+    await waitFor(() => element('accounts-guide').hidden === false, 3_000, 'guide on an older Cindy');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(element('accounts-open').hidden, true);
+    assert.match(element('accounts-guide-text').textContent, /设置 → 模型供应商 → Antigravity/);
   });
 
   test('listModels reads the model option agy offers, flattening its groups', async () => {
@@ -1195,10 +1160,8 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
     const badTypeAfterSave = await worker.call({ jsonrpc: '2.0', id: 8, method: 'setCustomPath', params: {} });
     assert.deepEqual(badTypeAfterSave.result, { ok: false, error: 'not-absolute' });
 
-    const acctBefore = await worker.call({ jsonrpc: '2.0', id: 9, method: 'account', params: {} });
-    assert.equal(acctBefore.result.supported, true);
-    assert.equal(acctBefore.result.signedIn, false);
-    const loginRes = await worker.call({ jsonrpc: '2.0', id: 10, method: 'login', params: {} });
+    assert.deepEqual((await worker.call({ jsonrpc: '2.0', id: 9, method: 'accountStatus', params: { harnessId: 'agy' } })).result, { state: 'signed-out' });
+    const loginRes = await worker.call({ jsonrpc: '2.0', id: 10, ...SIGN_IN });
     assert.equal(loginRes.result.ok, true);
     const modelsRes = await worker.call({ jsonrpc: '2.0', id: 11, method: 'listModels', params: {} });
     assert.equal(modelsRes.result.supported, true);
@@ -1280,7 +1243,7 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
     }
   });
 
-  test('main.js discards stale detect/listModels from the old binary, refreshes usage, and never leaks paths', async () => {
+  test('main.js discards stale detect/listModels from the old binary and never leaks paths', async () => {
     class Channel {
       static all = [];
       constructor(name) { this.name = name; this.onmessage = null; Channel.all.push(this); }
@@ -1360,7 +1323,6 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
     resolveDetectA({ ok: true, result: { available: true, path: '/bin/agy-a', version: '1.0.0' } });
     resolveListA({ ok: true, result: { supported: true, models: [{ id: 'model-a', name: 'Model A' }], sessionId: 'sess-a' } });
     await waitFor(() => puts.some((entry) => entry.version === '2.0.0' && entry.models?.[0]?.id === 'model-b'), 3_000, 'published B models');
-    await waitFor(() => received.some((m) => m.type === 'harness-usage' && m.usage?.windows?.[0]?.label === 'B · 5h'), 3_000, 'refreshed usage for B');
 
     const latest = puts.at(-1);
     assert.equal(latest.version, '2.0.0');
@@ -1415,11 +1377,10 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
     const main = new Channel('agy-acp');
     const savedPaths = [];
     const cliActions = [];
-    const account = { signedIn: true, canSignIn: true, canSignOut: true, busy: null };
     main.onmessage = ({ data }) => {
       if (data.type === 'detect-request') {
         main.postMessage({ type: 'detect-ack', reqId: data.reqId });
-        main.postMessage({ type: 'detect-result', reqId: data.reqId, snapshot: { ok: true, account,
+        main.postMessage({ type: 'detect-result', reqId: data.reqId, snapshot: { ok: true,
           result: { available: true, version: '1.5.9', path: '/usr/local/bin/agy' }, signInRequired: false, publish: { status: 'published' }, checkedAt: 1 } });
       }
       if (data.type === 'cli-state-request') main.postMessage({ type: 'cli-state' });
@@ -1427,22 +1388,18 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
         cliActions.push(data.action);
         main.postMessage({ type: 'cli-state', reqId: data.reqId, action: data.action, active: false, result: { state: 'current', version: '1.5.9' } });
       }
-      if (data.type === 'account-request') {
-        main.postMessage({ type: 'account-ack', reqId: data.reqId });
-        main.postMessage({ type: 'account-result', reqId: data.reqId, op: data.op, account });
-      }
       if (data.type === 'custom-path-request') {
         savedPaths.push(data.path);
         main.postMessage({ type: 'custom-path-ack', reqId: data.reqId });
         if (data.path === 'bad') {
           main.postMessage({ type: 'custom-path-result', reqId: data.reqId, ok: false, error: 'not-absolute' });
         } else if (data.path === '/gone/agy') {
-          main.postMessage({ type: 'custom-path-result', reqId: data.reqId, ok: true, snapshot: { ok: true, account,
+          main.postMessage({ type: 'custom-path-result', reqId: data.reqId, ok: true, snapshot: { ok: true,
             result: { available: false, reason: 'custom-path-unavailable', customPath: '/gone/agy', customPathConfigured: true },
             signInRequired: false, publish: { status: 'published' }, checkedAt: 2 } });
         } else {
           const customPath = data.path || undefined;
-          main.postMessage({ type: 'custom-path-result', reqId: data.reqId, ok: true, snapshot: { ok: true, account,
+          main.postMessage({ type: 'custom-path-result', reqId: data.reqId, ok: true, snapshot: { ok: true,
             result: { available: true, version: customPath ? '9.9.9' : '1.5.9', path: customPath || '/usr/local/bin/agy', ...(customPath ? { customPath, customPathConfigured: true } : {}) },
             signInRequired: false, publish: { status: 'published' }, checkedAt: 3 } });
         }
@@ -1549,7 +1506,7 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
     t.after(() => worker.close());
 
     // Start a hanging login on the default binary, then fire overlapping saves A (slow) and B (fast).
-    const loginPending = worker.call({ jsonrpc: '2.0', id: 1, method: 'login', params: {} });
+    const loginPending = worker.call({ jsonrpc: '2.0', id: 1, ...SIGN_IN });
     await waitFor(() => fs.existsSync(stateFile + '.log') && fs.readFileSync(stateFile + '.log', 'utf8').includes('authenticate:oauth-personal'), 5_000, 'login started');
 
     const saveA = worker.call({ jsonrpc: '2.0', id: 2, method: 'setCustomPath', params: { path: binA, locale: 'en' } });
@@ -1566,7 +1523,7 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
     assert.ok(samePath(finalDetect.result.customPath, binB));
 
     // A new login on B must succeed right away (never stuck as 'busy').
-    const loginB = await worker.call({ jsonrpc: '2.0', id: 5, method: 'login', params: {} });
+    const loginB = await worker.call({ jsonrpc: '2.0', id: 5, ...SIGN_IN });
     assert.equal(loginB.result.ok, true);
   });
 
@@ -1595,7 +1552,7 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
     t.after(() => worker.close());
 
     // Start login on default binary which hangs before replying to initialize.
-    const loginPending = worker.call({ jsonrpc: '2.0', id: 1, method: 'login', params: {} });
+    const loginPending = worker.call({ jsonrpc: '2.0', id: 1, ...SIGN_IN });
     await waitFor(() => fs.existsSync(stateFile + '.log') && fs.readFileSync(stateFile + '.log', 'utf8').includes('initialize'), 5_000, 'login initialize sent');
     const hungPid = readPid(fixture.pidFile);
     assert.ok(hungPid, 'hung agy process started');
@@ -1609,11 +1566,11 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
     assert.equal(saveResult.result.detection.version, '2.2.2');
     await waitFor(() => !isAlive(hungPid), 3_000, 'hung initialize agy killed');
 
-    const loginB = await worker.call({ jsonrpc: '2.0', id: 3, method: 'login', params: {} });
+    const loginB = await worker.call({ jsonrpc: '2.0', id: 3, ...SIGN_IN });
     assert.equal(loginB.result.ok, true);
   });
 
-  test('main.js serializes saves, drops stale login after path switch, and blocks path changes during update', async () => {
+  test('main.js serializes saves and blocks path changes during update', async () => {
     class Channel {
       static all = [];
       constructor(name) { this.name = name; this.onmessage = null; Channel.all.push(this); }
@@ -1625,11 +1582,8 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
       }
     }
     const puts = [];
-    const cancels = [];
-    let resolveLoginA;
     let resolveSaveA;
     let resolveUpdate;
-    let loginCalls = 0;
     const context = vm.createContext({
       BroadcastChannel: Channel, setTimeout, clearTimeout,
       cindy: {
@@ -1639,15 +1593,6 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
             if (request.method === 'detect') return { ok: true, result: { available: true, path: '/bin/agy', version: '1.0.0' } };
             if (request.method === 'listModels') return { ok: true, result: { supported: true, models: [{ id: 'm', name: 'M' }] } };
             if (request.method === 'usage') return { ok: true, result: null };
-            if (request.method === 'login') {
-              loginCalls += 1;
-              if (loginCalls === 1) return new Promise((resolve) => { resolveLoginA = resolve; });
-              return { ok: true, result: { ok: true, tier: { name: 'New Tier' } } };
-            }
-            if (request.method === 'cancelLogin') {
-              cancels.push(true);
-              return { ok: true, result: { ok: true, cancelled: true } };
-            }
             if (request.method === 'setCustomPath') {
               if (request.params.path === '/opt/agy-a') {
                 return new Promise((resolve) => {
@@ -1681,30 +1626,15 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
     const received = [];
     page.onmessage = (event) => received.push(event.data);
 
-    // Start login on initial binary, then fire overlapping saves A (slow) and B (fast).
-    page.postMessage({ type: 'account-request', reqId: 'login-a', op: 'login' });
-    await waitFor(() => typeof resolveLoginA === 'function', 3_000, 'login A started');
-
+    // Fire overlapping saves A (slow) and B (fast).
     page.postMessage({ type: 'custom-path-request', reqId: 'save-a', path: '/opt/agy-a' });
     page.postMessage({ type: 'custom-path-request', reqId: 'save-b', path: '/opt/agy-b' });
     await waitFor(() => typeof resolveSaveA === 'function', 3_000, 'save A started');
     resolveSaveA();
     await waitFor(() => received.some((m) => m.type === 'custom-path-result' && m.reqId === 'save-b'), 3_000, 'save B finished after A');
 
-    // Final published version must be B (2.0.0), and old login must have been cancelled.
+    // Final published version must be B (2.0.0).
     assert.equal(puts.at(-1).version, '2.0.0');
-    assert.ok(cancels.length >= 1, 'cancelLogin was called on path switch');
-
-    // Late resolution of A's login must not taint B or block a new login on B.
-    resolveLoginA({ ok: true, result: { ok: true, tier: { name: 'Old Tier' } } });
-    await waitFor(() => received.some((m) => m.type === 'account-result' && m.reqId === 'login-a'), 3_000, 'stale login settled');
-    assert.equal(received.find((m) => m.type === 'account-result' && m.reqId === 'login-a').error, 'cancelled');
-
-    page.postMessage({ type: 'account-request', reqId: 'login-b', op: 'login' });
-    await waitFor(() => received.some((m) => m.type === 'account-result' && m.reqId === 'login-b'), 3_000, 'login B succeeded');
-    const loginBResult = received.find((m) => m.type === 'account-result' && m.reqId === 'login-b');
-    assert.equal(loginBResult.error, undefined);
-    assert.equal(loginBResult.account.tier, 'New Tier');
 
     // Path changes are rejected with 'busy' while a CLI update is active.
     page.postMessage({ type: 'cli-maintenance', reqId: 'upd-1', action: 'update', version: '2.1.0' });
@@ -1714,7 +1644,7 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
     assert.equal(received.find((m) => m.type === 'custom-path-result' && m.reqId === 'save-during-upd').error, 'busy');
     resolveUpdate();
   });
-  test('worker.js refuses sign-in and sign-out while a custom path is being saved', async (t) => {
+  test('worker.js refuses a sign-in while a custom path is being saved', async (t) => {
     const stateFile = path.join(os.tmpdir(), `agy-save-busy-${process.pid}-${Date.now()}`);
     t.after(() => {
       fs.rmSync(stateFile, { force: true });
@@ -1741,95 +1671,11 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
     t.after(() => worker.close());
 
     const save = worker.call({ jsonrpc: '2.0', id: 1, method: 'setCustomPath', params: { path: slowBin, locale: 'en' } });
-    const logout = await worker.call({ jsonrpc: '2.0', id: 2, method: 'logout', params: {} });
-    const login = await worker.call({ jsonrpc: '2.0', id: 3, method: 'login', params: {} });
-    assert.deepEqual(logout.result, { ok: false, error: 'busy' });
+    const login = await worker.call({ jsonrpc: '2.0', id: 3, ...SIGN_IN });
     assert.deepEqual(login.result, { ok: false, error: 'busy' });
     assert.equal((await save).result.ok, true);
-    assert.equal(fs.readFileSync(stateFile, 'utf8'), 'signed-in', 'neither request reached an agy');
-
-    // Once the save is over, the same request signs out on the new binary.
-    const after = await worker.call({ jsonrpc: '2.0', id: 4, method: 'logout', params: {} });
-    assert.deepEqual(after.result, { ok: true });
-    assert.equal(fs.readFileSync(stateFile, 'utf8'), 'signed-out');
-  });
-
-  test('main.js refuses sign-in and sign-out during a custom path save, and a sign-out asked for the replaced path', async () => {
-    class Channel {
-      static all = [];
-      constructor(name) { this.name = name; this.onmessage = null; Channel.all.push(this); }
-      postMessage(data) {
-        const copy = JSON.parse(JSON.stringify(data));
-        for (const other of Channel.all) {
-          if (other !== this && other.name === this.name && other.onmessage) setTimeout(() => other.onmessage({ data: copy }), 0);
-        }
-      }
-    }
-    const puts = [];
-    const workerCalls = [];
-    let resolveSave;
-    const context = vm.createContext({
-      BroadcastChannel: Channel, setTimeout, clearTimeout,
-      cindy: {
-        request: async () => ({ ok: true, context: { locale: 'en', uiLocale: 'en' } }),
-        node: {
-          request: async (request) => {
-            workerCalls.push(request.method);
-            if (request.method === 'detect') return { ok: true, result: { available: true, path: '/bin/agy', version: '1.0.0' } };
-            if (request.method === 'listModels') return { ok: true, result: { supported: true, models: [{ id: 'm', name: 'M' }] } };
-            if (request.method === 'usage') return { ok: true, result: null };
-            if (request.method === 'account') return { ok: true, result: { supported: true, signedIn: true, canSignIn: true, canSignOut: true } };
-            if (request.method === 'login' || request.method === 'logout') return { ok: true, result: { ok: true } };
-            if (request.method === 'setCustomPath') {
-              return new Promise((resolve) => {
-                resolveSave = () => resolve({ ok: true, result: { ok: true, customPath: '/opt/agy-b',
-                  detection: { available: true, path: '/opt/agy-b', customPath: '/opt/agy-b', customPathConfigured: true, version: '2.0.0' } } });
-              });
-            }
-            return { ok: false };
-          },
-        },
-        onHostMessage: () => () => {},
-      },
-      fetch: async (url, init) => {
-        if (url === '/kv' && !init) return { ok: true, json: async () => ({}) };
-        if (url === '/harnesses') puts.push(JSON.parse(init.body).harnesses[0]);
-        return { ok: true, status: 204 };
-      },
-    });
-    vm.runInContext(fs.readFileSync(path.join(root, 'main.js'), 'utf8'), context, { filename: 'main.js' });
-    await waitFor(() => puts.length > 0, 3_000, 'initial publish');
-
-    const page = new Channel('agy-acp');
-    const received = [];
-    page.onmessage = (event) => received.push(event.data);
-    const resultOf = (reqId) => received.find((m) => m.type === 'account-result' && m.reqId === reqId);
-
-    page.postMessage({ type: 'custom-path-request', reqId: 'save', path: '/opt/agy-b' });
-    await waitFor(() => typeof resolveSave === 'function', 3_000, 'save started');
-    page.postMessage({ type: 'account-request', reqId: 'out-1', op: 'logout' });
-    page.postMessage({ type: 'account-request', reqId: 'in-1', op: 'login' });
-    await waitFor(() => resultOf('out-1') && resultOf('in-1'), 3_000, 'account requests answered');
-    assert.equal(resultOf('out-1').error, 'busy');
-    assert.equal(resultOf('in-1').error, 'busy');
-    assert.ok(!workerCalls.includes('logout') && !workerCalls.includes('login'), 'neither request reached the worker');
-
-    resolveSave();
-    await waitFor(() => received.some((m) => m.type === 'custom-path-result' && m.reqId === 'save'), 3_000, 'save finished');
-    const generation = received.find((m) => m.type === 'custom-path-result' && m.reqId === 'save').snapshot.generation;
-    assert.equal(typeof generation, 'number');
-
-    // A sign-out confirmed for the state shown before the switch is refused, even when it only arrives after the save.
-    page.postMessage({ type: 'account-request', reqId: 'out-stale', op: 'logout', generation: generation - 1 });
-    await waitFor(() => resultOf('out-stale'), 3_000, 'stale logout answered');
-    assert.equal(resultOf('out-stale').error, 'stale');
-    assert.ok(!workerCalls.includes('logout'), 'the stale request did not reach the worker');
-
-    // The same request for the state of the new executable goes through.
-    page.postMessage({ type: 'account-request', reqId: 'out-2', op: 'logout', generation });
-    await waitFor(() => resultOf('out-2'), 3_000, 'logout after the save');
-    assert.equal(resultOf('out-2').error, undefined);
-    assert.ok(workerCalls.includes('logout'));
+    const sentToAgy = fs.existsSync(stateFile + '.log') ? fs.readFileSync(stateFile + '.log', 'utf8') : '';
+    assert.ok(!sentToAgy.includes('authenticate'), 'the request reached no agy');
   });
 
   test('setCustomPath still finishes when the cancelled sign-in ignores SIGTERM', async (t) => {
@@ -1855,7 +1701,7 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
     t.after(() => worker.close());
 
     // The default binary never answers `initialize` and ignores SIGTERM.
-    const loginPending = worker.call({ jsonrpc: '2.0', id: 1, method: 'login', params: {} });
+    const loginPending = worker.call({ jsonrpc: '2.0', id: 1, ...SIGN_IN });
     await waitFor(() => fs.existsSync(stateFile + '.log') && fs.readFileSync(stateFile + '.log', 'utf8').includes('initialize'), 5_000, 'login initialize sent');
     const hungPid = readPid(fixture.pidFile);
     assert.ok(hungPid, 'hung agy process started');
@@ -1907,8 +1753,7 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
       fetch: async (url) => ({ ok: true, json: async () => (url === '/app-context' ? { context: { uiLocale: 'en' } } : { state: 'on' }) }),
     });
     const main = new Channel('agy-acp');
-    const account = { signedIn: true, canSignIn: true, canSignOut: true, busy: null };
-    const snapshotFor = (version, customPath) => ({ ok: true, account,
+    const snapshotFor = (version, customPath) => ({ ok: true,
       result: { available: true, version, path: customPath || '/usr/local/bin/agy', ...(customPath ? { customPath, customPathConfigured: true } : {}) },
       signInRequired: false, publish: { status: 'published' }, checkedAt: 1 });
     let heldReqId = null;
@@ -1918,10 +1763,6 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
         main.postMessage({ type: 'detect-result', reqId: data.reqId, snapshot: snapshotFor('1.5.9') });
       }
       if (data.type === 'cli-state-request') main.postMessage({ type: 'cli-state' });
-      if (data.type === 'account-request') {
-        main.postMessage({ type: 'account-ack', reqId: data.reqId });
-        main.postMessage({ type: 'account-result', reqId: data.reqId, op: data.op, account });
-      }
       if (data.type === 'custom-path-request') {
         // This window's save of C waits for its answer, as another window's save of B goes through first.
         heldReqId = data.reqId;
@@ -2054,180 +1895,6 @@ process.stdin.on('end', () => process.exit(0));
     assert.equal((await reply(7, 'session/list refusal')).error.code, -32601);
     bridge.child.stdin.end();
     assert.equal((await bridge.closed).code, 0);
-  });
-
-  test('settings.js tags sign-in and sign-out with the state the user acted on, and drops a refusal note once it no longer applies', async () => {
-    class Channel {
-      static all = [];
-      constructor(name) { this.name = name; this.onmessage = null; this.listeners = []; Channel.all.push(this); }
-      addEventListener(type, listener) { if (type === 'message') this.listeners.push(listener); }
-      postMessage(data) {
-        const copy = JSON.parse(JSON.stringify(data));
-        for (const other of Channel.all) {
-          if (other === this || other.name !== this.name) continue;
-          setTimeout(() => {
-            other.onmessage?.({ data: copy });
-            for (const listener of other.listeners) listener({ data: copy });
-          }, 0);
-        }
-      }
-    }
-    const elements = new Map();
-    const element = (id) => {
-      if (!elements.has(id)) {
-        const listeners = {};
-        elements.set(id, { id, value: '', placeholder: '', textContent: '', hidden: false, disabled: false, attributes: {}, dataset: {}, listeners,
-          setAttribute(name, value) { this.attributes[name] = value; },
-          addEventListener(type, listener) { listeners[type] = listener; },
-          focus() {},
-          click() { listeners.click(); } });
-      }
-      return elements.get(id);
-    };
-    let wakeGate = null;
-    const context = vm.createContext({
-      BroadcastChannel: Channel, crypto: globalThis.crypto, setTimeout, clearTimeout, setInterval, clearInterval,
-      document: { getElementById: element, documentElement: {}, visibilityState: 'visible', addEventListener() {} },
-      fetch: async (url) => {
-        if (url === '/wake' && wakeGate) await wakeGate;
-        return { ok: true, json: async () => (url === '/app-context' ? { context: { uiLocale: 'en' } } : { state: 'on' }) };
-      },
-    });
-    const main = new Channel('agy-acp');
-    const account = { signedIn: true, canSignIn: true, canSignOut: true, busy: null };
-    const snapshotFor = (generation, version) => ({ ok: true, account, generation,
-      result: { available: true, version, path: '/usr/local/bin/agy' }, signInRequired: false, publish: { status: 'published' }, checkedAt: 1 });
-    const accountRequests = [];
-    let detectRequests = 0;
-    let refusal = null;
-    let heldReqId = null;
-    main.onmessage = ({ data }) => {
-      if (data.type === 'detect-request') {
-        detectRequests += 1;
-        main.postMessage({ type: 'detect-ack', reqId: data.reqId });
-        main.postMessage({ type: 'detect-result', reqId: data.reqId, snapshot: snapshotFor(3, '1.5.9') });
-      }
-      if (data.type === 'cli-state-request') main.postMessage({ type: 'cli-state' });
-      if (data.type === 'account-request') {
-        accountRequests.push(data);
-        main.postMessage({ type: 'account-ack', reqId: data.reqId });
-        main.postMessage({ type: 'account-result', reqId: data.reqId, op: data.op, account, ...(refusal && data.op === 'logout' ? { error: refusal } : {}) });
-      }
-      if (data.type === 'custom-path-request') {
-        heldReqId = data.reqId;
-        main.postMessage({ type: 'custom-path-ack', reqId: data.reqId });
-      }
-    };
-    context.window = context;
-    vm.runInContext(fs.readFileSync(path.join(root, 'cli-settings.js'), 'utf8'), context, { filename: 'cli-settings.js' });
-    vm.runInContext(fs.readFileSync(path.join(root, 'settings.js'), 'utf8'), context, { filename: 'settings.js' });
-    await waitFor(() => element('version').textContent === '1.5.9', 3_000, 'initial detect');
-    const signOut = () => {
-      element('account-logout').click();
-      element('account-confirm-yes').click();
-    };
-
-    // A refusal for a replaced path is explained, makes the page read its state again, and the explanation outlives that check.
-    refusal = 'stale';
-    const detectsBefore = detectRequests;
-    signOut();
-    await waitFor(() => accountRequests.some((request) => request.op === 'logout'), 3_000, 'sign-out sent');
-    assert.equal(accountRequests.find((request) => request.op === 'logout').generation, 3, 'the request names the state the page shows');
-    const logoutIndex = accountRequests.findIndex((request) => request.op === 'logout');
-    await waitFor(() => element('account-note').textContent.includes('executable changed'), 3_000, 'stale refusal explained');
-    await waitFor(() => detectRequests > detectsBefore, 3_000, 'the page read its state again');
-    await waitFor(() => accountRequests.slice(logoutIndex + 1).some((request) => request.op === 'status'), 3_000, 'sign-in checked again after the refresh');
-    assert.ok(element('account-note').textContent.includes('executable changed'), 'the refresh does not wipe the explanation');
-
-    // The request keeps the state the user confirmed on, even when the page shows another one by the time it is sent.
-    refusal = null;
-    let openWake;
-    wakeGate = new Promise((resolve) => { openWake = resolve; });
-    const requestsBefore = accountRequests.length;
-    signOut();
-    main.postMessage({ type: 'detect-result', reqId: 'other-view', snapshot: snapshotFor(4, '9.9.9') });
-    await waitFor(() => element('version').textContent === '9.9.9', 3_000, 'newer state shown while the request waits for /wake');
-    wakeGate = null;
-    openWake();
-    await waitFor(() => accountRequests.slice(requestsBefore).some((request) => request.op === 'logout'), 3_000, 'sign-out sent after /wake');
-    assert.equal(accountRequests.slice(requestsBefore).find((request) => request.op === 'logout').generation, 3, 'generation of the confirmation, not of the send');
-
-    // A refusal made while a save of our own waits does not outlive that save.
-    refusal = 'busy';
-    element('custom-path-input').value = '/opt/c/agy';
-    element('custom-path-input').listeners.input();
-    element('custom-path-save').click();
-    await waitFor(() => heldReqId !== null, 3_000, 'save sent');
-    signOut();
-    await waitFor(() => element('account-note').textContent.includes('hasn’t finished'), 3_000, 'busy refusal shown');
-    main.postMessage({ type: 'custom-path-result', reqId: heldReqId, ok: false, error: 'not-runnable' });
-    await waitFor(() => element('custom-path-note').attributes['data-tone'] === 'error', 3_000, 'save failed');
-    assert.equal(element('account-note').textContent, '', 'the busy note is gone once the save is over');
-
-    // Nor does it outlive a save that another window started and that failed.
-    signOut();
-    await waitFor(() => element('account-note').textContent.includes('hasn’t finished'), 3_000, 'busy refusal shown again');
-    main.postMessage({ type: 'custom-path-result', reqId: 'other-window', ok: false, error: 'not-runnable' });
-    await waitFor(() => element('account-note').textContent === '', 3_000, 'busy note gone after the other window’s save failed');
-  });
-
-  test('main.js never reuses a generation across restarts, so a restarted main.js refuses a sign-out asked for the previous one', async () => {
-    const boot = async () => {
-      class Channel {
-        static all = [];
-        constructor(name) { this.name = name; this.onmessage = null; Channel.all.push(this); }
-        postMessage(data) {
-          const copy = JSON.parse(JSON.stringify(data));
-          for (const other of Channel.all) {
-            if (other !== this && other.name === this.name && other.onmessage) setTimeout(() => other.onmessage({ data: copy }), 0);
-          }
-        }
-      }
-      const puts = [];
-      const workerCalls = [];
-      const context = vm.createContext({
-        BroadcastChannel: Channel, setTimeout, clearTimeout,
-        cindy: {
-          request: async () => ({ ok: true, context: { locale: 'en', uiLocale: 'en' } }),
-          node: {
-            request: async (request) => {
-              workerCalls.push(request.method);
-              if (request.method === 'detect') return { ok: true, result: { available: true, path: '/bin/agy', version: '1.0.0' } };
-              if (request.method === 'listModels') return { ok: true, result: { supported: true, models: [{ id: 'm', name: 'M' }] } };
-              if (request.method === 'usage') return { ok: true, result: null };
-              if (request.method === 'account') return { ok: true, result: { supported: true, signedIn: true, canSignIn: true, canSignOut: true } };
-              if (request.method === 'logout') return { ok: true, result: { ok: true } };
-              return { ok: false };
-            },
-          },
-          onHostMessage: () => () => {},
-        },
-        fetch: async (url, init) => {
-          if (url === '/kv' && !init) return { ok: true, json: async () => ({}) };
-          if (url === '/harnesses') puts.push(JSON.parse(init.body).harnesses[0]);
-          return { ok: true, status: 204 };
-        },
-      });
-      vm.runInContext(fs.readFileSync(path.join(root, 'main.js'), 'utf8'), context, { filename: 'main.js' });
-      await waitFor(() => puts.length > 0, 3_000, 'initial publish');
-      const page = new Channel('agy-acp');
-      const received = [];
-      page.onmessage = (event) => received.push(event.data);
-      page.postMessage({ type: 'detect-request', reqId: 'detect' });
-      await waitFor(() => received.some((m) => m.type === 'detect-result'), 3_000, 'detect result');
-      return { page, received, workerCalls, generation: received.find((m) => m.type === 'detect-result').snapshot.generation };
-    };
-
-    const first = await boot();
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    const second = await boot();
-    assert.ok(second.generation > first.generation, 'a later instance starts from a later generation');
-
-    // A page that still holds the first instance's generation asks the second one for a sign-out.
-    second.page.postMessage({ type: 'account-request', reqId: 'out-old', op: 'logout', generation: first.generation });
-    await waitFor(() => second.received.some((m) => m.type === 'account-result' && m.reqId === 'out-old'), 3_000, 'sign-out answered');
-    assert.equal(second.received.find((m) => m.type === 'account-result' && m.reqId === 'out-old').error, 'stale');
-    assert.ok(!second.workerCalls.includes('logout'), 'the stale request did not reach the worker');
   });
 
 });
