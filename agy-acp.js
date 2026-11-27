@@ -142,7 +142,15 @@ function run(agyPath, options) {
     process.stdout,
     child,
     () => stop('SIGTERM'),
-    accountErrorRelay(),
+    accountErrorRelay(options && options.accountDir ? {
+      accountDir: options.accountDir,
+      onIsolationViolation: () => {
+        try {
+          process.stderr.write('[agy-acp] Antigravity opened a session without isolated sign-in files; stopping to prevent default-login fallback.\n');
+        } catch { /* ignore */ }
+        setImmediate(() => stop('SIGTERM'));
+      },
+    } : undefined),
   );
   child.stdin.on('error', () => {
     // EPIPE after agy exited; the exit handler takes care of shutting down.

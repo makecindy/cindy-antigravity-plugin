@@ -7,6 +7,7 @@
  */
 
 const { isObject, isSessionOpen } = require('./agy-mcp.js');
+const { hasIsolatedStoreFile } = require('./agy-account-dir.js');
 
 const QUOTA_REASONS = new Set([
   'QUOTA_EXHAUSTED',
@@ -92,23 +93,44 @@ function classifyAccountErrorResponse(message, now = Date.now()) {
   };
 }
 
-/** Tracks session open / prompt request IDs so only their error responses carry `_meta.cindy`. */
-function accountErrorRelay() {
-  const pending = new Set();
+/**
+ * Tracks session open / prompt request IDs so only their error responses carry `_meta.cindy`.
+ * When `options.accountDir` is set, also guards session-open successes against an agy build that
+ * ignored isolated file storage and silently fell back to the default keyring login.
+ */
+function accountErrorRelay(options) {
+  const accountDir = options && typeof options.accountDir === 'string' && options.accountDir ? options.accountDir : null;
+  const onIsolationViolation = options && typeof options.onIsolationViolation === 'function' ? options.onIsolationViolation : null;
+  const pending = new Map();
   return {
     request(message) {
       if (!isObject(message) || message.id === undefined) return;
-      if (isSessionOpen(message.method) || message.method === 'session/prompt') {
+      const sessionOpen = isSessionOpen(message.method);
+      if (sessionOpen || message.method === 'session/prompt') {
         if (pending.size >= MAX_TRACKED_REQUESTS) {
-          const oldest = pending.values().next().value;
+          const oldest = pending.keys().next().value;
           pending.delete(oldest);
         }
-        pending.add(message.id);
+        pending.set(message.id, sessionOpen);
       }
     },
     response(message) {
       if (!isObject(message) || message.method !== undefined || message.id === undefined) return message;
-      if (!pending.delete(message.id)) return message;
+      if (!pending.has(message.id)) return message;
+      const sessionOpen = pending.get(message.id);
+      pending.delete(message.id);
+      if (sessionOpen && accountDir && message.error === undefined && isObject(message.result) && !hasIsolatedStoreFile(accountDir)) {
+        if (onIsolationViolation) onIsolationViolation();
+        return {
+          jsonrpc: '2.0',
+          id: message.id,
+          error: {
+            code: -32000,
+            message: 'Antigravity ignored isolated account storage; refusing to run on the default login.',
+            data: { _meta: { cindy: { kind: 'auth-required' } } },
+          },
+        };
+      }
       return classifyAccountErrorResponse(message);
     },
   };
