@@ -256,6 +256,14 @@ function startRemoteWorkspace(agyPath, host) {
   let agentExited = false;
   let sessionRequest = null;
   let warmup = null;
+  /** Id of the session/new (or load/resume) passed on to agy, until agy answers it. */
+  let openingId = null;
+  /** Ends the warmed sessions agy has not taken over; finish() waits for the same promise. */
+  let warmupRelease = null;
+  const releaseWarmup = () => {
+    if (warmup && !warmupRelease) warmupRelease = warmup.close();
+    return warmupRelease || Promise.resolve();
+  };
   let finished = false;
   let stopCode = null;
   let forceTimer = null;
@@ -294,7 +302,7 @@ function startRemoteWorkspace(agyPath, host) {
       if (exiting) return;
       exiting = true;
       // Warmed MCP sessions agy never took over are ended on the other computer before the process goes.
-      const reclaimed = warmup ? warmup.close() : Promise.resolve();
+      const reclaimed = releaseWarmup();
       Promise.race([reclaimed, new Promise((resolve) => setTimeout(resolve, WARMUP_CLOSE_GRACE_MS))])
         .finally(() => process.exit(code));
     };
@@ -451,8 +459,15 @@ function startRemoteWorkspace(agyPath, host) {
     if (phase === 'opening' && message.id === initRequest.id && message.method === undefined) {
       const startSession = (mcpServers) => {
         if (finished || stopCode !== null) return;
-        if (message.error) toClient({ jsonrpc: '2.0', id: sessionRequest.id, error: message.error }, agent.stdout);
-        else toAgent({ ...sessionRequest, params: { ...sessionRequest.params, mcpServers } });
+        if (message.error) {
+          // agy could not start: it will never take over the warmed sessions, so they are ended now.
+          releaseWarmup();
+          toClient({ jsonrpc: '2.0', id: sessionRequest.id, error: message.error }, agent.stdout);
+        } else {
+          const opened = { ...sessionRequest, params: { ...sessionRequest.params, mcpServers } };
+          openingId = opened.id;
+          toAgent(opened);
+        }
         phase = 'session';
         for (const pending of queued.splice(0)) toAgentLine(pending);
       };
@@ -463,6 +478,11 @@ function startRemoteWorkspace(agyPath, host) {
       phase = 'warming';
       warmup.ready.then(startSession, () => startSession(sessionRequest.params.mcpServers));
       return;
+    }
+    if (openingId !== null && message.method === undefined && message.id === openingId) {
+      openingId = null;
+      // The session did not open: agy will not use the warmed sessions it has not taken over.
+      if (message.error) releaseWarmup();
     }
     const params = isObject(message.params) ? message.params : null;
     const isPermission = message.method === 'session/request_permission' && message.id !== undefined;
