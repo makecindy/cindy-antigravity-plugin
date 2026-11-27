@@ -148,7 +148,7 @@ Google 账号，按账号池策略混用（最少占用、轮询、按顺序、�
 | `agy-account.js` | 经 ACP 查询登录状态、从 agy 的日志读出账号邮箱、用 Google 登录、取消登录（支持原有登录与独立账号目录） |
 | `agy-acp.js` | ACP 引擎入口：处理 `--cindy-account-dir`、启动 `agy acp`，双向转发 ACP，支持插话与错误分类 |
 | `remote-workspace.js` | 任务文件在另一台电脑时：受限 Agent 的定义、两段式启动、账号目录透传，以及读懂 ACP 的转接 |
-| `settings.html` / `settings.js` | 设置页：检测结果、版本、位置、自定义路径、安装提示、到模型供应商管理账号的引导与「重新检测」 |
+| `settings.html` / `settings.js` | 设置页：检测结果、版本、位置、自定义路径、安装提示、到模型供应商管理账号的引导（Cindy 支持时带「在模型供应商里管理」按钮）与「重新检测」 |
 | `locales/` | 清单名称与说明的英文、简体中文文案 |
 | `test/bridge.test.mjs` | 用假 agy 验证检测、自定义路径、转发、参数与发布（`node --test test/bridge.test.mjs`） |
 
