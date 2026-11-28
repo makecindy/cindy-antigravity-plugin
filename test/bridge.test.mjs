@@ -86,6 +86,14 @@ if (JSON.stringify(args) === REMOTE_ARGS) {
         record({ method: message.method, session: message.params });
         if (message.method === 'session/resume') call = DIRECT_CALL;
         send({ id: message.id, result: { sessionId: 'sess-1', configOptions: [] } });
+      } else if (message.method === 'session/prompt' && process.env.FAKE_AGY_SCRIPT === 'limits') {
+        const scenario = message.params.prompt[0].text;
+        const errors = {
+          quota: { code: -32603, message: 'Provider request failed', data: { reason: 'MODEL_QUOTA_EXHAUSTED' } },
+          rate: { code: -32603, message: 'HTTP 429: too many requests' },
+          capacity: { code: -32603, message: 'HTTP 503: unavailable', data: { reason: 'MODEL_CAPACITY_EXHAUSTED' } },
+        };
+        send({ id: message.id, error: errors[scenario] });
       } else if (message.method === 'session/prompt' && process.env.FAKE_AGY_SCRIPT === 'native') {
         // An agy that ignored the agent's tool list: one of its own tools runs, and the turn stays open.
         send({ method: 'session/update', params: { sessionId: 'sess-1', update: { sessionUpdate: 'tool_call', toolCallId: 'call-n',
@@ -457,6 +465,28 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
       [['tool_call', 'Bash', 'execute'], ['tool_call_update', 'Bash', 'execute']]);
     bridge.child.stdin.end();
     assert.equal((await bridge.closed).code, 0);
+  });
+
+  test('remote workspace forwards explicit quota to Cindy without retrying the prompt', {
+    skip: process.platform !== 'linux',
+  }, async (t) => {
+    const { bridge, messages, send, reply, server } = remoteSession(t, { FAKE_AGY_SCRIPT: 'limits' });
+    bridge.child.stdin.write(INITIALIZE);
+    await reply(0, 'initialize answer');
+    send({ jsonrpc: '2.0', id: 1, method: 'session/new',
+      params: { cwd: '/shadow/p', mcpServers: [server('cindy_exec')] } });
+    await reply(1, 'session/new answer');
+
+    for (const [index, scenario] of ['quota', 'rate', 'capacity'].entries()) {
+      const id = index + 2;
+      send({ jsonrpc: '2.0', id, method: 'session/prompt',
+        params: { sessionId: 'sess-1', prompt: [{ type: 'text', text: scenario }] } });
+      const { error } = await reply(id, scenario);
+      assert.equal(error.data?._meta?.cindy?.kind, scenario === 'quota' ? 'usage-limit' : undefined);
+    }
+    bridge.child.stdin.end();
+    assert.equal((await bridge.closed).code, 0);
+    assert.deepEqual(messages().map(message => message.id), [0, 1, 2, 3, 4]);
   });
 
   test('remote-workspace mode does not start a session without Cindy’s file and command tools', async (t) => {
@@ -957,6 +987,61 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
       message: 'Antigravity 还没有登录。请打开 Antigravity 插件设置，点「用 Google 登录」。' });
   });
 
+  test('Linux keeps imported accounts and discovers their models when the default login signs out', async () => {
+    const puts = [];
+    let hostMessage;
+    let postToSettings;
+    let channel;
+    const detection = { available: true, version: '1.5.15', linuxAccounts: true };
+    const ctx = vm.createContext({
+      BroadcastChannel: class {
+        constructor() { channel = this; }
+        postMessage(message) { postToSettings?.(message); }
+      },
+      setTimeout,
+      clearTimeout,
+      cindy: {
+        request: async () => ({ ok: true, context: { locale: 'en' } }),
+        node: {
+          request: async ({ method }) => ({
+            ok: true,
+            result: {
+              detect: detection,
+              listModels: { supported: true, models: [{ id: 'default-model', name: 'Default account model' }] },
+              logout: { ok: true },
+            }[method],
+          }),
+        },
+        onHostMessage: (handler) => { hostMessage = handler; },
+      },
+      fetch: async (url, init) => {
+        if (url === '/kv' && !init) return { ok: true, json: async () => ({}) };
+        if (url === '/harnesses') puts.push(JSON.parse(init.body).harnesses[0]);
+        return { ok: true, status: 204 };
+      },
+    });
+    vm.runInContext(fs.readFileSync(path.join(root, 'main.js'), 'utf8'), ctx, { filename: 'main.js' });
+    await waitFor(() => puts.at(-1)?.models?.[0]?.id === 'default-model', 3_000, 'default model list');
+    hostMessage({
+      type: 'event', name: 'node-notification', method: 'imported-account-catalog',
+      params: { models: [{ id: 'imported-model', name: 'Imported account model', efforts: ['low', 'high'] }],
+        modes: ['default', 'plan'], defaultMode: 'plan' },
+    });
+    assert.equal(puts.at(-1).models[0].id, 'default-model');
+    let logoutResult;
+    postToSettings = (message) => {
+      if (message.type === 'account-result' && message.reqId === 'signed-out') logoutResult = message;
+    };
+    channel.onmessage({ data: { type: 'account-request', reqId: 'signed-out', op: 'logout' } });
+    await waitFor(() => logoutResult, 3_000, 'default sign out');
+    assert.equal(logoutResult.account.signedIn, false);
+    assert.equal(puts.at(-1).available, true);
+    assert.equal(puts.at(-1).accounts.methods[0].id, 'linux-keyring');
+    assert.equal(puts.at(-1).reason, undefined);
+    assert.deepEqual(puts.at(-1).models, [{ id: 'imported-model', name: 'Imported account model', efforts: ['low', 'high'] }]);
+    assert.equal(puts.at(-1).defaultMode, 'plan');
+  });
+
   // agy 的 logout 一调用就登出(2026-11-19 实测)：设置页只在用户确认后才发出退出请求。
   test('the settings page resumes a CLI update after reopening and confirms sign-out', async () => {
     class Channel {
@@ -1180,6 +1265,7 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
     const afterFailedSave = await worker.call({ jsonrpc: '2.0', id: 6, method: 'detect', params: { locale: 'en' } });
     assert.equal(afterFailedSave.result.customPath, undefined);
     assert.equal(afterFailedSave.result.version, '0.2.2');
+    assert.equal(typeof afterFailedSave.result.linuxAccounts, 'boolean');
 
     // Saving a quoted custom path succeeds and routes detect, account, login, listModels, usage, and agy-acp to it.
     const saved = await worker.call({ jsonrpc: '2.0', id: 7, method: 'setCustomPath', params: { path: `"${customBin}"`, locale: 'en' } });
@@ -1188,6 +1274,7 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
     assert.equal(saved.result.detection.available, true);
     assert.equal(saved.result.detection.version, '9.9.9');
     assert.equal(saved.result.detection.customPathConfigured, true);
+    assert.equal(saved.result.detection.linuxAccounts, afterFailedSave.result.linuxAccounts);
     assert.ok(samePath(saved.result.detection.path, customBin));
     assert.ok(samePath(saved.result.detection.customPath, customBin));
 
@@ -1256,6 +1343,7 @@ describe('agy-acp plugin', { concurrency: true, timeout: 20_000 }, () => {
     assert.equal(cleared.result.customPath, null);
     assert.equal(cleared.result.detection.available, true);
     assert.equal(cleared.result.detection.version, '0.2.2');
+    assert.equal(cleared.result.detection.linuxAccounts, afterFailedSave.result.linuxAccounts);
     assert.equal(cleared.result.detection.customPath, undefined);
     assert.ok(samePath(cleared.result.detection.path, fixture.agyPath));
     await worker.close();

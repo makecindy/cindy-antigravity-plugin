@@ -252,6 +252,7 @@ function startRemoteWorkspace(agyPath, host) {
   let stdinEnded = false;
   const queued = [];
   const seenCalls = new Map();
+  const { accountErrors } = host;
   let serverNames = [];
 
   const running = (child) => Boolean(child) && child.exitCode === null && child.signalCode === null;
@@ -397,6 +398,7 @@ function startRemoteWorkspace(agyPath, host) {
     phase = 'opening';
     serverNames = servers.map((server) => server.name);
     sessionRequest = { ...request, params: { ...request.params, mcpServers: servers } };
+    accountErrors?.request(sessionRequest);
     const current = agent;
     current.on('error', (error) => {
       if (current.pid === undefined) {
@@ -438,6 +440,11 @@ function startRemoteWorkspace(agyPath, host) {
       for (const pending of queued.splice(0)) toAgentLine(pending);
       return;
     }
+    const classified = accountErrors?.response(message) ?? message;
+    if (classified !== message) {
+      toClient(classified, agent.stdout);
+      return;
+    }
     const params = isObject(message.params) ? message.params : null;
     const isPermission = message.method === 'session/request_permission' && message.id !== undefined;
     const update = message.method === 'session/update' && params && isObject(params.update) ? params.update : null;
@@ -476,10 +483,12 @@ function startRemoteWorkspace(agyPath, host) {
       return;
     }
     if (phase === 'session') {
+      accountErrors?.request(message);
       toAgentLine(line);
       return;
     }
     if (phase === 'opening') {
+      accountErrors?.request(message);
       queued.push(line);
       return;
     }

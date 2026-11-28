@@ -51,7 +51,7 @@ function supportsSteering(agentVersion) {
  * as soon as a new one takes over. Keep Cindy's original request open until
  * the newest prompt finishes and relay all of the session's streamed updates.
  */
-function attachSteering(input, output, child, stop) {
+function attachSteering(input, output, child, stop, accountErrors) {
   const turns = new Map();
   const requests = new Map();
   const openingSessions = new Map();
@@ -78,8 +78,9 @@ function attachSteering(input, output, child, stop) {
   }
 
   const toClient = lineTransform((line) => {
-    const message = parse(line);
-    if (!message) return line;
+    const original = parse(line);
+    if (!original) return line;
+    const message = isAntigravity && accountErrors ? accountErrors.response(original) : original;
     if (message.method) {
       const normalized = isAntigravity && normalizeToolMessage(message);
       return normalized ? encode(normalized) : line;
@@ -104,7 +105,7 @@ function attachSteering(input, output, child, stop) {
     }
 
     const turn = requests.get(message.id);
-    if (!turn) return line;
+    if (!turn) return message === original ? line : encode(message);
     requests.delete(message.id);
     if (message.id === turn.latestId) turn.result = message;
     if (--turn.pending !== 0) return null;
@@ -117,6 +118,7 @@ function attachSteering(input, output, child, stop) {
     if (!message?.method || message.id === undefined) return line;
     const params = message.params;
     if (message.method === 'initialize') initializeId = message.id;
+    if (isAntigravity && accountErrors) accountErrors.request(message);
     if (isAntigravity && isSessionOpen(message.method)) {
       const servers = Array.isArray(params?.mcpServers) ? params.mcpServers : [];
       const serverNames = servers.map((server) => server?.name).filter((name) => typeof name === 'string' && name);
@@ -143,9 +145,11 @@ function attachSteering(input, output, child, stop) {
     // Acknowledge the bridge accepting input before agy can emit its output.
     // Native submission failures then surface on the original prompt.
     toClient.push(encode({ jsonrpc: '2.0', id: message.id, result: { outcome: 'injected' } }));
-    return encode({ jsonrpc: '2.0', id, method: 'session/prompt', params: {
+    const injected = { jsonrpc: '2.0', id, method: 'session/prompt', params: {
       sessionId: turn.sessionId, prompt: params.prompt,
-    } });
+    } };
+    if (accountErrors) accountErrors.request(injected);
+    return encode(injected);
   });
   toAgent.on('error', stop);
   toClient.on('error', stop);
